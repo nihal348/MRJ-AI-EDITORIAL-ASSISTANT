@@ -1,5 +1,4 @@
 streamlit
-python-docx
 pdfplumber
-requests
-python-dotenv
+python-docx
+groq
