@@ -1,4 +1,5 @@
 streamlit
-pdfplumber
-python-docx
 groq
+python-docx
+pdfplumber
+requests
