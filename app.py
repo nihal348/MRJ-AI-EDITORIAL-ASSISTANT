@@ -97,7 +97,7 @@ def run_ai_analysis(text, literature):
     if not api_key:
         return {"status": "NOT_RUN", "message": "API Key missing. Please set GROQ_API_KEY in Secrets."}
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    url = "https://api.groq.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     
     prompt = f"""
