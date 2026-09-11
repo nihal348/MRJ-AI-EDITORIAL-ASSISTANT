@@ -1,6 +1,7 @@
-import io, os, json, requests, pdfplumber
+import io, os, re, pdfplumber
 from docx import Document
 import streamlit as st
+from groq import Groq
 
 def extract_text(uploaded):
     data = uploaded.getvalue()
@@ -10,65 +11,82 @@ def extract_text(uploaded):
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
+def sanitize_text_for_blind_review(text):
+    # Remove email addresses
+    text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[AUTHOR EMAIL REDACTED]', text)
+    # Remove ORCID identifiers
+    text = re.sub(r'https?://orcid\.org/\d{4}-\d{4}-\d{4}-\d{3}[\dX]', '[ORCID REDACTED]', text)
+    
+    clean_lines = []
+    skip = False
+    for line in text.split('\n'):
+        # Filter typical author affiliation metadata blocks near the beginning
+        line_lower = line.strip().lower()
+        if any(keyword in line_lower for keyword in ["university", "department of", "faculty of", "correspondence to:", "affiliated with"]):
+            clean_lines.append("[AFFILIATION REDACTED]")
+            continue
+        clean_lines.append(line)
+        
+    return "\n".join(clean_lines)
+
 def run_ai_analysis(text):
     api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
     if not api_key:
         return {"status": "ERROR", "message": "API Key missing. Please set GROQ_API_KEY in Secrets."}
     
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": "You are a journal editor assistant. Evaluate structural compliance, methodologies, and ethics disclosures."},
-            {"role": "user", "content": f"Analyze manuscript for structure and compliance: {text[:15000]}"}
-        ],
-        "temperature": 0.2
-    }
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        r.raise_for_status()
-        return {"status": "OK", "result": r.json()["choices"][0]["message"]["content"]}
+        # Using official Groq Python client
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a professional academic journal editor assistant. Check the manuscript for overall structure, methodology details, and compliance disclosures."},
+                {"role": "user", "content": f"Analyze this manuscript text:\n\n{text[:15000]}"}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.2
+        )
+        return {"status": "OK", "result": response.choices[0].message.content}
     except Exception as e:
-        return {"status": "ERROR", "message": f"API Error: {str(e)}"}
+        return {"status": "ERROR", "message": f"Groq Client Error: {str(e)}"}
 
 def generate_blind_copy(text):
+    sanitized = sanitize_text_for_blind_review(text)
     doc = Document()
     doc.add_heading('Anonymized Manuscript (Blind Reviewer Copy)', 0)
-    for paragraph in text.split('\n'):
-        if paragraph.strip():
-            doc.add_paragraph(paragraph)
+    
+    for line in sanitized.split('\n'):
+        if line.strip():
+            doc.add_paragraph(line)
+            
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-# App UI
+# App Interface
 st.set_page_config(page_title="Journal AI Pre-Screening", layout="wide")
 st.title("Journal AI Editorial Pre-Screening")
 
 uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["docx", "pdf"])
 
 if uploaded_file:
-    text_content = extract_text(uploaded_file)
+    raw_text = extract_text(uploaded_file)
     
-    # 1. Provide the blind copy download immediately
-    st.subheader("1. Anonymized Blind Reviewer Copy")
-    blind_docx = generate_blind_copy(text_content)
-    st.download_button(
-        label="Download Blind Reviewer Copy (.docx)",
-        data=blind_docx,
-        file_name="Blind_Reviewer_Copy.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
-    
-    # 2. Run the AI Pipeline
-    st.subheader("2. AI Analysis & Compliance Findings")
     if st.button("Run Pre-Screening Pipeline", type="primary"):
-        with st.spinner("Analyzing manuscript..."):
-            res = run_ai_analysis(text_content)
+        with st.spinner("Analyzing manuscript via Groq AI..."):
+            res = run_ai_analysis(raw_text)
             
+            st.subheader("1. AI Analysis & Compliance Findings")
             if res["status"] == "OK":
                 st.success("Analysis Complete!")
                 st.write(res["result"])
             else:
                 st.error(res["message"])
+
+        st.subheader("2. Anonymized Blind Reviewer Copy")
+        blind_docx = generate_blind_copy(raw_text)
+        st.download_button(
+            label="Download Blind Reviewer Copy (.docx)",
+            data=blind_docx,
+            file_name="Blind_Reviewer_Copy.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
