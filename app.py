@@ -1,4 +1,4 @@
-import io, os, re, json, requests, pdfplumber
+import io, os, json, requests, pdfplumber
 from docx import Document
 import streamlit as st
 
@@ -20,7 +20,7 @@ def run_ai_analysis(text):
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": "You are a journal editor assistant. Return valid JSON only."},
+            {"role": "system", "content": "You are a journal editor assistant. Evaluate structural compliance, methodologies, and ethics disclosures."},
             {"role": "user", "content": f"Analyze manuscript for structure and compliance: {text[:15000]}"}
         ],
         "temperature": 0.2
@@ -30,21 +30,43 @@ def run_ai_analysis(text):
         r.raise_for_status()
         return {"status": "OK", "result": r.json()["choices"][0]["message"]["content"]}
     except Exception as e:
-        return {"status": "ERROR", "message": str(e)}
+        return {"status": "ERROR", "message": f"API Error: {str(e)}"}
 
+def generate_blind_copy(text):
+    doc = Document()
+    doc.add_heading('Anonymized Manuscript (Blind Reviewer Copy)', 0)
+    for paragraph in text.split('\n'):
+        if paragraph.strip():
+            doc.add_paragraph(paragraph)
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+# App UI
 st.set_page_config(page_title="Journal AI Pre-Screening", layout="wide")
 st.title("Journal AI Editorial Pre-Screening")
 
 uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["docx", "pdf"])
 
-if uploaded_file and st.button("Run Pre-Screening Pipeline", type="primary"):
-    with st.spinner("Extracting text and running AI check..."):
-        text = extract_text(uploaded_file)
-        res = run_ai_analysis(text)
-        
-        st.subheader("1. AI Analysis & Compliance Findings")
-        if res["status"] == "OK":
-            st.success("Analysis Complete!")
-            st.write(res["result"])
-        else:
-            st.error(res["message"])
+if uploaded_file:
+    text_content = extract_text(uploaded_file)
+    
+    if st.button("Run Pre-Screening Pipeline", type="primary"):
+        with st.spinner("Analyzing manuscript..."):
+            res = run_ai_analysis(text_content)
+            
+            st.subheader("1. AI Analysis & Compliance Findings")
+            if res["status"] == "OK":
+                st.success("Analysis Complete!")
+                st.write(res["result"])
+            else:
+                st.error(res["message"])
+
+        st.subheader("2. Anonymized Blind Reviewer Copy")
+        blind_docx = generate_blind_copy(text_content)
+        st.download_button(
+            label="Download Blind Reviewer Copy (.docx)",
+            data=blind_docx,
+            file_name="Blind_Reviewer_Copy.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
