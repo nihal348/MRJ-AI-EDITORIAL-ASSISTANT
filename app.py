@@ -12,21 +12,20 @@ def extract_text(uploaded):
         return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
 def sanitize_text_for_blind_review(text):
-    # Remove email addresses
+    # Strip emails
     text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[AUTHOR EMAIL REDACTED]', text)
-    # Remove ORCID identifiers
+    # Strip ORCID identifiers
     text = re.sub(r'https?://orcid\.org/\d{4}-\d{4}-\d{4}-\d{3}[\dX]', '[ORCID REDACTED]', text)
     
     clean_lines = []
-    skip = False
     for line in text.split('\n'):
-        # Filter typical author affiliation metadata blocks near the beginning
         line_lower = line.strip().lower()
-        if any(keyword in line_lower for keyword in ["university", "department of", "faculty of", "correspondence to:", "affiliated with"]):
+        # Redact typical author affiliation metadata blocks
+        if any(kw in line_lower for kw in ["university", "department of", "faculty of", "correspondence to:", "affiliated with"]):
             clean_lines.append("[AFFILIATION REDACTED]")
-            continue
-        clean_lines.append(line)
-        
+        else:
+            clean_lines.append(line)
+            
     return "\n".join(clean_lines)
 
 def run_ai_analysis(text):
@@ -35,14 +34,13 @@ def run_ai_analysis(text):
         return {"status": "ERROR", "message": "API Key missing. Please set GROQ_API_KEY in Secrets."}
     
     try:
-        # Using official Groq Python client
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a professional academic journal editor assistant. Check the manuscript for overall structure, methodology details, and compliance disclosures."},
+                {"role": "system", "content": "You are a professional academic journal editor assistant. Evaluate manuscript structure, methodology, and compliance disclosures."},
                 {"role": "user", "content": f"Analyze this manuscript text:\n\n{text[:15000]}"}
             ],
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",  # Active replacement for deprecated Llama models
             temperature=0.2
         )
         return {"status": "OK", "result": response.choices[0].message.content}
@@ -62,7 +60,7 @@ def generate_blind_copy(text):
     doc.save(bio)
     return bio.getvalue()
 
-# App Interface
+# Streamlit App Layout
 st.set_page_config(page_title="Journal AI Pre-Screening", layout="wide")
 st.title("Journal AI Editorial Pre-Screening")
 
