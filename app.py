@@ -51,22 +51,24 @@ uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["doc
 if uploaded_file:
     text_content = extract_text(uploaded_file)
     
+    # 1. Provide the blind copy download immediately
+    st.subheader("1. Anonymized Blind Reviewer Copy")
+    blind_docx = generate_blind_copy(text_content)
+    st.download_button(
+        label="Download Blind Reviewer Copy (.docx)",
+        data=blind_docx,
+        file_name="Blind_Reviewer_Copy.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    
+    # 2. Run the AI Pipeline
+    st.subheader("2. AI Analysis & Compliance Findings")
     if st.button("Run Pre-Screening Pipeline", type="primary"):
         with st.spinner("Analyzing manuscript..."):
             res = run_ai_analysis(text_content)
             
-            st.subheader("1. AI Analysis & Compliance Findings")
             if res["status"] == "OK":
                 st.success("Analysis Complete!")
                 st.write(res["result"])
             else:
                 st.error(res["message"])
-
-        st.subheader("2. Anonymized Blind Reviewer Copy")
-        blind_docx = generate_blind_copy(text_content)
-        st.download_button(
-            label="Download Blind Reviewer Copy (.docx)",
-            data=blind_docx,
-            file_name="Blind_Reviewer_Copy.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
