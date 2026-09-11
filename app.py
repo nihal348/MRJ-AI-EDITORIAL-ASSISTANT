@@ -80,11 +80,23 @@ if uploaded_file:
             else:
                 st.error(res["message"])
 
-        st.subheader("2. Anonymized Blind Reviewer Copy")
-        blind_docx = generate_blind_copy(raw_text)
-        st.download_button(
-            label="Download Blind Reviewer Copy (.docx)",
-            data=blind_docx,
-            file_name="Blind_Reviewer_Copy.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+        # Complete Report Download
+                    report_docx = generate_report_docx(res["result"], raw_text)
+                    st.download_button(
+                        label="Download Complete Pre-Screening Report (.docx)",
+                        data=report_docx,
+                        file_name="Editorial_PreScreening_Report.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                else:
+                    st.error(res["message"])
+
+            st.subheader("2. Anonymized Blind Reviewer Copy")
+            sanitized_text = sanitize_text_for_blind_review(raw_text, client)
+            blind_docx = generate_blind_copy_docx(sanitized_text)
+            st.download_button(
+                label="Download Blind Reviewer Copy (.docx)",
+                data=blind_docx,
+                file_name="Blind_Reviewer_Copy.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
