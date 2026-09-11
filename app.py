@@ -12,9 +12,8 @@ def extract_text(uploaded):
         return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
 def sanitize_text_for_blind_review(text, client=None):
-    # Strip emails
+    # Strip emails and ORCID identifiers
     text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[AUTHOR EMAIL REDACTED]', text)
-    # Strip ORCID identifiers
     text = re.sub(r'https?://orcid\.org/\d{4}-\d{4}-\d{4}-\d{3}[\dX]', '[ORCID REDACTED]', text)
     
     clean_lines = []
@@ -27,7 +26,7 @@ def sanitize_text_for_blind_review(text, client=None):
             
     scrubbed = "\n".join(clean_lines)
 
-    # Use LLM to scrub human author names from the header if client is passed
+    # Use LLM to scrub human author names from the header if client is available
     if client:
         try:
             response = client.chat.completions.create(
@@ -35,7 +34,7 @@ def sanitize_text_for_blind_review(text, client=None):
                     {"role": "system", "content": "You are a text anonymization tool. Replace all author names and co-author names with '[AUTHOR NAME REDACTED]'. Do not alter abstract or paper contents. Return ONLY sanitized text."},
                     {"role": "user", "content": scrubbed[:3000]}
                 ],
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-120b",
                 temperature=0.0
             )
             return response.choices[0].message.content + "\n" + scrubbed[3000:]
@@ -50,7 +49,7 @@ def run_ai_analysis(text, client):
                 {"role": "system", "content": "You are a professional academic journal editor assistant. Evaluate manuscript structure, methodology, and compliance disclosures."},
                 {"role": "user", "content": f"Analyze this manuscript text:\n\n{text[:15000]}"}
             ],
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             temperature=0.2
         )
         return {"status": "OK", "result": response.choices[0].message.content}
