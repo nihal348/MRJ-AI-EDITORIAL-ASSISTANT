@@ -442,67 +442,111 @@ AI_SCHEMA = {
 }
 
 
-def run_ai_analysis(text: str, deterministic_checks: List[Dict[str, Any]], client: Groq) -> Dict[str, Any]:
-    # Keep the prompt bounded and focused on editorially useful content.
+def run_ai_analysis(
+    text: str,
+    deterministic_checks: List[Dict[str, Any]],
+    client: Groq,
+) -> Dict[str, Any]:
+    """
+    Run the qualitative MRJ assessment with a deliberately small prompt.
+
+    Groq's on-demand tier can impose a tokens-per-minute limit. The previous
+    implementation sent the same manuscript information several times
+    (section extracts + a 30,000-character full excerpt), which unnecessarily
+    inflated the request. This version sends only the information needed for
+    the qualitative assessment.
+    """
     abstract = extract_abstract(text)
     methods = extract_section_text(text, "materials and methods")
     results = extract_section_text(text, "results and discussion")
     conclusions = extract_section_text(text, "conclusions")
 
+    # Deterministic checks are already performed in Python. Give the model only
+    # their compact status/evidence summary; do not resend the manuscript.
     rule_summary = "\n".join(
-        f"- {c['requirement']}: {c['status']} | {c['evidence']}"
+        f"- {c['requirement']}: {c['status']} — {c['evidence']}"
         for c in deterministic_checks
-    )
+    )[:7000]
 
+    # Hard character caps keep the request comfortably below the 8,000 TPM
+    # limit on the user's current Groq on-demand tier.
     prompt = f"""
-You are an academic journal editorial pre-screening assistant for the Multidisciplinary Research Journal (MRJ).
+You are a cautious academic journal editorial pre-screening assistant for MRJ.
 
-IMPORTANT:
-- Do not invent facts, authors, reviewers, institutions, citations, or experimental results.
+Rules:
+- Assess only supplied evidence.
+- Never invent authors, reviewers, institutions, citations, results, or facts.
 - Do not rewrite the manuscript.
-- Treat the deterministic MRJ checks below as the source of truth for those formatting/compliance checks.
-- Your job is to assess only the supplied manuscript content.
+- Deterministic checks below are authoritative for formatting/compliance.
 - If evidence is insufficient, say so.
-- Do not make a final peer-review acceptance/rejection decision.
-- Identify concerns that should be checked by a human editor.
+- Do not make an acceptance/rejection decision.
+- Return only the requested structured assessment.
 
 DETERMINISTIC MRJ CHECKS:
 {rule_summary}
 
 ABSTRACT:
-{abstract[:6000]}
+{abstract[:3500]}
 
 MATERIALS AND METHODS:
-{methods[:12000]}
+{methods[:6500]}
 
 RESULTS AND DISCUSSION:
-{results[:12000]}
+{results[:7000]}
 
 CONCLUSIONS:
-{conclusions[:6000]}
-
-FULL MANUSCRIPT EXCERPT:
-{text[:30000]}
+{conclusions[:3000]}
 """
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a cautious journal-editor assistant. Return only the requested structured assessment.",
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a cautious journal-editor assistant. "
+                        "Return only the requested structured assessment."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            reasoning_effort="medium",
+            max_tokens=900,
+            response_format={
+                "type": "json_schema",
+                "json_schema": AI_SCHEMA,
             },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        reasoning_effort="medium",
-        response_format={
-            "type": "json_schema",
-            "json_schema": AI_SCHEMA,
-        },
-    )
+        )
 
-    return json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content or ""
+        return json.loads(content)
+
+    except Exception as exc:
+        # Keep the application usable when Groq throttles the request.
+        # The deterministic MRJ checks remain available and are not discarded.
+        error_text = str(exc)
+        if "413" in error_text or "tokens per minute" in error_text.lower():
+            return {
+                "summary": (
+                    "The deterministic MRJ checks were completed, but the "
+                    "qualitative Groq assessment was skipped because the "
+                    "current Groq tokens-per-minute limit was exceeded."
+                ),
+                "research_area": "Not assessed",
+                "keywords": [],
+                "methodology_assessment": "Not assessed because the AI request was rate-limited.",
+                "results_discussion_assessment": "Not assessed because the AI request was rate-limited.",
+                "abstract_alignment": "Not assessed because the AI request was rate-limited.",
+                "potential_major_concerns": [
+                    "Groq request exceeded the current tokens-per-minute limit. "
+                    "The manuscript was not modified."
+                ],
+                "editorial_recommendation": "Needs author correction",
+            }
+
+        raise
 
 
 # ============================================================
@@ -1258,4 +1302,3 @@ if "mrj_checks" in st.session_state:
             "identifying sections are removed, while existing runs and document formatting are retained "
             "where possible. The application does not ask the LLM to rewrite the manuscript."
         )
-
