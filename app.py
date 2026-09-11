@@ -1,54 +1,50 @@
-# ============================================================
-# 4. FREE LLM AI ANALYSIS LAYER (Groq API)
-# ============================================================
-def run_ai_analysis(text, literature):
-    api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
+import io, os, re, json, requests, pdfplumber
+from docx import Document
+import streamlit as st
+
+def extract_text(uploaded):
+    data = uploaded.getvalue()
+    if uploaded.name.lower().endswith(".docx"):
+        doc = Document(io.BytesIO(data))
+        return "\n".join([p.text for p in doc.paragraphs if p.text])
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        return "\n".join([p.extract_text() or "" for p in pdf.pages])
+
+def run_ai_analysis(text):
+    api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
     if not api_key:
-        return {"status": "NOT_RUN", "message": "API Key missing. Please set GROQ_API_KEY in Secrets."}
-
-    # Clean whitespace from the API key to avoid header errors
-    api_key = str(api_key).strip().strip('"').strip("'")
-
+        return {"status": "ERROR", "message": "API Key missing. Please set GROQ_API_KEY in Secrets."}
+    
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    prompt = f"""
-    Analyze this academic manuscript as an editorial pre-screening assistant.
-    Check for:
-    1. Structural completeness (Abstract, Methods, Results, Funding, Conflicts).
-    2. Internal consistency (Sample sizes, causal statements in observational studies).
-    3. Ethics statements.
-
-    MANUSCRIPT EXTRACT:
-    {text[:25000]}
-
-    Return JSON strictly in this structure:
-    {{
-        "overall_status": "GREEN/AMBER/RED",
-        "findings": [
-            {{"category": "category_name", "severity": "BLOCKING/EDITOR_REVIEW/SUGGESTION", "finding": "description"}}
-        ]
-    }}
-    """
-    
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": "You are a journal editor assistant. Always return valid JSON only."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "You are a journal editor assistant. Return valid JSON only."},
+            {"role": "user", "content": f"Analyze manuscript for structure and compliance: {text[:15000]}"}
         ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1
+        "temperature": 0.2
     }
-
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         return {"status": "OK", "result": r.json()["choices"][0]["message"]["content"]}
-    except requests.exceptions.HTTPError as err:
-        return {"status": "ERROR", "message": f"HTTP Error {r.status_code}: {r.text}"}
     except Exception as e:
         return {"status": "ERROR", "message": str(e)}
+
+st.set_page_config(page_title="Journal AI Pre-Screening", layout="wide")
+st.title("Journal AI Editorial Pre-Screening")
+
+uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["docx", "pdf"])
+
+if uploaded_file and st.button("Run Pre-Screening Pipeline", type="primary"):
+    with st.spinner("Extracting text and running AI check..."):
+        text = extract_text(uploaded_file)
+        res = run_ai_analysis(text)
+        
+        st.subheader("1. AI Analysis & Compliance Findings")
+        if res["status"] == "OK":
+            st.success("Analysis Complete!")
+            st.write(res["result"])
+        else:
+            st.error(res["message"])
