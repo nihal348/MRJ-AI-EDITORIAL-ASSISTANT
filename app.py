@@ -11,7 +11,7 @@ def extract_text(uploaded):
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
-def sanitize_text_for_blind_review(text):
+def sanitize_text_for_blind_review(text, client=None):
     # Strip emails
     text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[AUTHOR EMAIL REDACTED]', text)
     # Strip ORCID identifiers
@@ -20,39 +20,62 @@ def sanitize_text_for_blind_review(text):
     clean_lines = []
     for line in text.split('\n'):
         line_lower = line.strip().lower()
-        # Redact typical author affiliation metadata blocks
-        if any(kw in line_lower for kw in ["university", "department of", "faculty of", "correspondence to:", "affiliated with"]):
+        if any(kw in line_lower for kw in ["university", "department of", "faculty of", "correspondence to:", "affiliated with", "institute of"]):
             clean_lines.append("[AFFILIATION REDACTED]")
         else:
             clean_lines.append(line)
             
-    return "\n".join(clean_lines)
+    scrubbed = "\n".join(clean_lines)
 
-def run_ai_analysis(text):
-    api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
-    if not api_key:
-        return {"status": "ERROR", "message": "API Key missing. Please set GROQ_API_KEY in Secrets."}
-    
+    # Use LLM to scrub human author names from the header if client is passed
+    if client:
+        try:
+            response = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are a text anonymization tool. Replace all author names and co-author names with '[AUTHOR NAME REDACTED]'. Do not alter abstract or paper contents. Return ONLY sanitized text."},
+                    {"role": "user", "content": scrubbed[:3000]}
+                ],
+                model="llama-3.3-70b-versatile",
+                temperature=0.0
+            )
+            return response.choices[0].message.content + "\n" + scrubbed[3000:]
+        except Exception:
+            return scrubbed
+    return scrubbed
+
+def run_ai_analysis(text, client):
     try:
-        client = Groq(api_key=api_key)
         response = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "You are a professional academic journal editor assistant. Evaluate manuscript structure, methodology, and compliance disclosures."},
                 {"role": "user", "content": f"Analyze this manuscript text:\n\n{text[:15000]}"}
             ],
-            model="openai/gpt-oss-120b",  # Active replacement for deprecated Llama models
+            model="llama-3.3-70b-versatile",
             temperature=0.2
         )
         return {"status": "OK", "result": response.choices[0].message.content}
     except Exception as e:
         return {"status": "ERROR", "message": f"Groq Client Error: {str(e)}"}
 
-def generate_blind_copy(text):
-    sanitized = sanitize_text_for_blind_review(text)
+def generate_report_docx(ai_result, raw_text):
+    doc = Document()
+    doc.add_heading('Editorial AI Pre-Screening Summary Report', 0)
+    
+    doc.add_heading('1. AI Analysis & Compliance Findings', level=1)
+    doc.add_paragraph(ai_result)
+    
+    doc.add_heading('2. Original Manuscript Preview (First 5,000 Characters)', level=1)
+    doc.add_paragraph(raw_text[:5000] + ("..." if len(raw_text) > 5000 else ""))
+    
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+def generate_blind_copy_docx(sanitized_text):
     doc = Document()
     doc.add_heading('Anonymized Manuscript (Blind Reviewer Copy)', 0)
     
-    for line in sanitized.split('\n'):
+    for line in sanitized_text.split('\n'):
         if line.strip():
             doc.add_paragraph(line)
             
@@ -68,19 +91,23 @@ uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["doc
 
 if uploaded_file:
     raw_text = extract_text(uploaded_file)
+    api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
     
-    if st.button("Run Pre-Screening Pipeline", type="primary"):
-        with st.spinner("Analyzing manuscript via Groq AI..."):
-            res = run_ai_analysis(raw_text)
-            
-            st.subheader("1. AI Analysis & Compliance Findings")
-            if res["status"] == "OK":
-                st.success("Analysis Complete!")
-                st.write(res["result"])
-            else:
-                st.error(res["message"])
+    if not api_key:
+        st.error("API Key missing. Please set GROQ_API_KEY in Secrets.")
+    else:
+        client = Groq(api_key=api_key)
 
-        # Complete Report Download
+        if st.button("Run Pre-Screening Pipeline", type="primary"):
+            with st.spinner("Analyzing manuscript via Groq AI..."):
+                res = run_ai_analysis(raw_text, client)
+                
+                st.subheader("1. AI Analysis & Compliance Findings")
+                if res["status"] == "OK":
+                    st.success("Analysis Complete!")
+                    st.write(res["result"])
+                    
+                    # Full Pre-Screening Report Download
                     report_docx = generate_report_docx(res["result"], raw_text)
                     st.download_button(
                         label="Download Complete Pre-Screening Report (.docx)",
