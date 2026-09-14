@@ -862,7 +862,12 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 
     paragraphs = list(doc.paragraphs)
     for i, p in enumerate(paragraphs):
-        heading = normalize(p.text).lower().rstrip(":")
+        try:
+            p_text = p.text
+        except (AttributeError, ValueError, KeyError):
+            # Skip malformed/unsupported DOCX XML nodes safely.
+            continue
+        heading = normalize(p_text).lower().rstrip(":")
         if heading not in removable_section_starts:
             continue
 
