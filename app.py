@@ -430,11 +430,43 @@ AI_CALL_3_SCHEMA = assessment_schema("mrj_results_discussion_conclusion", {
     ["results", "discussion", "conclusion", "abstract_conclusion_alignment", "reference_use", "major_red_flags", "editorial_recommendation"])
 
 
-def _groq_json_call(client: Groq, schema: Dict[str, Any], prompt: str, max_tokens: int = 650) -> Dict[str, Any]:
-    response = client.chat.completions.create(model=GROQ_MODEL, messages=[
-        {"role": "system", "content": "You are a cautious academic journal pre-screening assistant. Assess only evidence supplied. Never invent facts, citations, authors, reviewers, institutions, sample sizes, results, statistical tests, ethics approvals, or research questions. If evidence is missing, use NOT ASSESSABLE. Do not rewrite manuscript text. Return only JSON."},
-        {"role": "user", "content": prompt}], temperature=0, reasoning_effort="medium", max_tokens=max_tokens,
-        response_format={"type": "json_schema", "json_schema": schema})
+def _groq_json_call(client: Groq, schema: Dict[str, Any], prompt: str, max_tokens: int = 1200) -> Dict[str, Any]:
+    """Call Groq Structured Outputs with enough budget for GPT-OSS JSON generation."""
+    request = dict(
+        model=GROQ_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a cautious academic journal pre-screening assistant. "
+                    "Assess only evidence supplied. Never invent facts, citations, "
+                    "authors, reviewers, institutions, sample sizes, results, "
+                    "statistical tests, ethics approvals, or research questions. "
+                    "If evidence is missing, use NOT ASSESSABLE. Do not rewrite "
+                    "manuscript text. Keep findings, evidence, and actions concise. "
+                    "Return only the JSON required by the schema."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+        reasoning_effort="low",
+        include_reasoning=False,
+        max_completion_tokens=max_tokens,
+        response_format={"type": "json_schema", "json_schema": schema},
+    )
+
+    try:
+        response = client.chat.completions.create(**request)
+    except Exception as exc:
+        # If GPT-OSS exhausts its completion budget before constrained JSON is
+        # complete, retry once with a larger completion budget.
+        msg = str(exc).lower()
+        if "max completion tokens" not in msg and "json_validate_failed" not in msg:
+            raise
+        request["max_completion_tokens"] = max(2400, max_tokens * 2)
+        response = client.chat.completions.create(**request)
+
     return json.loads(response.choices[0].message.content or "{}")
 
 
@@ -467,7 +499,7 @@ INTRODUCTION:
 {intro[:3800]}
 
 Assess: explicit research question/objective; abstract coverage of background, methods, results and conclusion; and whether the introduction establishes a supported gap/objective/novelty. Extract a concise research area and useful search keywords. Never infer missing facts. Use NOT ASSESSABLE when evidence is insufficient."""
-        a = _groq_json_call(client, AI_CALL_1_SCHEMA, prompt1, 600)
+        a = _groq_json_call(client, AI_CALL_1_SCHEMA, prompt1, 1200)
         prompt2 = f"""MRJ PRE-SCREEN: METHODOLOGY, STATISTICS, ETHICS
 
 MRJ CHECKS:
@@ -477,7 +509,7 @@ MATERIALS AND METHODS:
 {methods[:5000]}
 
 Assess methodology completeness/reproducibility; appropriateness and reporting of statistics/data analysis; and ethics/consent/animal/reproducibility information where relevant. Do not invent missing sample sizes, tests or approvals. Use NOT ASSESSABLE when evidence is insufficient."""
-        b = _groq_json_call(client, AI_CALL_2_SCHEMA, prompt2, 600)
+        b = _groq_json_call(client, AI_CALL_2_SCHEMA, prompt2, 1200)
         prompt3 = f"""MRJ PRE-SCREEN: RESULTS, DISCUSSION, CONCLUSION, REFERENCES
 
 ABSTRACT:
@@ -493,7 +525,7 @@ REFERENCES:
 {refs[:2400]}
 
 Assess whether results answer the objective; discussion interprets rather than merely repeats; conclusion is supported and appropriately limited; abstract/conclusion are aligned; and citations/references are used coherently. Do not verify reference facts from memory. List only evidence-supported major red flags. Give a pre-screening recommendation, not an acceptance/rejection decision."""
-        c = _groq_json_call(client, AI_CALL_3_SCHEMA, prompt3, 680)
+        c = _groq_json_call(client, AI_CALL_3_SCHEMA, prompt3, 1400)
         out = {}; out.update(a); out.update(b); out.update(c)
         assess_keys = ["research_question","abstract","introduction_novelty","methodology","statistics","ethics_reproducibility","results","discussion","conclusion","abstract_conclusion_alignment","reference_use"]
         concern_count = sum(out.get(k, {}).get("status") in ("CONCERN", "MAJOR CONCERN") for k in assess_keys)
@@ -862,12 +894,7 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 
     paragraphs = list(doc.paragraphs)
     for i, p in enumerate(paragraphs):
-        try:
-            p_text = p.text
-        except (AttributeError, ValueError, KeyError):
-            # Skip malformed/unsupported DOCX XML nodes safely.
-            continue
-        heading = normalize(p_text).lower().rstrip(":")
+        heading = normalize(p.text).lower().rstrip(":")
         if heading not in removable_section_starts:
             continue
 
