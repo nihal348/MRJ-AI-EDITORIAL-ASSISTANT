@@ -821,7 +821,8 @@ def redact_run_text(text: str) -> str:
 
 def iter_all_paragraphs(doc: Document):
     for p in doc.paragraphs:
-        yield p
+        if p is not None:
+            yield p
 
     for table in doc.tables:
         for row in table.rows:
@@ -850,6 +851,8 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
     body_paragraphs = list(doc.paragraphs)
     abstract_idx = None
     for i, p in enumerate(body_paragraphs):
+        if p is None:
+            continue
         if re.match(r"(?i)^\s*abstract\s*:?", p.text.strip()):
             abstract_idx = i
             break
@@ -860,7 +863,7 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
     if abstract_idx is not None:
         nonempty_before = [
             (i, p) for i, p in enumerate(body_paragraphs[:abstract_idx])
-            if p.text.strip()
+            if p is not None and p.text.strip()
         ]
 
         if nonempty_before:
@@ -868,7 +871,7 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
             for i, p in enumerate(body_paragraphs[:abstract_idx]):
                 if i == title_idx:
                     continue
-                if p.text.strip():
+                if p is not None and p.text.strip():
                     delete_paragraph(p)
 
     # 4. Remove identifying standalone paragraphs throughout the document.
@@ -892,8 +895,10 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
         "acknowledgements",
     }
 
-    paragraphs = list(doc.paragraphs)
+    paragraphs = [p for p in doc.paragraphs if p is not None]
     for i, p in enumerate(paragraphs):
+        if p._element is None or p._element.getparent() is None:
+            continue
         heading = normalize(p.text).lower().rstrip(":")
         if heading not in removable_section_starts:
             continue
@@ -901,6 +906,8 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
         # Delete heading and following paragraphs until the next obvious heading.
         delete_paragraph(p)
         for q in paragraphs[i + 1:]:
+            if q is None or q._element is None or q._element.getparent() is None:
+                continue
             qtxt = normalize(q.text)
             if re.match(r"^(?:\d+(?:\.\d+)*)?\s*[A-Z][A-Za-z &/-]{2,60}$", qtxt):
                 break
