@@ -2,7 +2,8 @@ import io
 import json
 import os
 import re
-from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import pdfplumber
@@ -13,12 +14,11 @@ from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
 from groq import Groq
 
-
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # ============================================================
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 OPENALEX_URL = "https://api.openalex.org/works"
 OPENALEX_AUTHOR_URL = "https://api.openalex.org/authors"
 
@@ -62,13 +62,13 @@ SECTION_ALIASES = {
     "multidisciplinary domains": ["multidisciplinary domains"],
     "funding": ["funding"],
     "acknowledgments": ["acknowledgments", "acknowledgements"],
-    "conflicts of interest": ["conflicts of interest", "conflict of interest"],
+    "conflicts of interest": ["conflicts of interest", "conflict of interest", "competing interests"],
     "declaration on ai usage": [
         "declaration on ai usage",
         "ai usage",
         "artificial intelligence",
     ],
-    "references": ["references", "reference"],
+    "references": ["references", "reference", "bibliography"],
 }
 
 NORTHEAST_STATES = {
@@ -84,7 +84,7 @@ NORTHEAST_STATES = {
 
 NORTHEAST_INSTITUTION_TERMS = [
     "iit guwahati",
-    "tezu university",
+    "tezpur university",
     "tezu",
     "nit silchar",
     "assam university",
@@ -95,18 +95,21 @@ NORTHEAST_INSTITUTION_TERMS = [
     "north-eastern hill university",
     "niser",
     "nit agartala",
-    "central university of jharkhand",
     "manipur university",
     "mizoram university",
     "nagaland university",
     "tripura university",
     "rajiv gandhi university",
-    "arunachal university",
     "sikkim university",
 ]
 
 ASSAM_TERMS = [
     "assam",
+    "guwahati",
+    "silchar",
+    "tezpur",
+    "dibrugarh",
+    "jorhat",
     "iit guwahati",
     "gauhati university",
     "cotton university",
@@ -123,6 +126,7 @@ ASSAM_TERMS = [
 # ============================================================
 
 def get_secret(name: str, default: str = "") -> str:
+    """Retrieve environment secrets from Streamlit secrets or OS environment."""
     try:
         value = st.secrets.get(name)
         if value:
@@ -138,10 +142,6 @@ def normalize(text: str) -> str:
 
 def word_count(text: str) -> int:
     return len(re.findall(r"\b[\w'-]+\b", text or ""))
-
-
-def first_nonempty_lines(text: str, limit: int = 20) -> List[str]:
-    return [x.strip() for x in (text or "").splitlines() if x.strip()][:limit]
 
 
 def find_section_positions(lines: List[str]) -> Dict[str, int]:
@@ -167,20 +167,24 @@ def extract_section_text(text: str, canonical: str) -> str:
 
 def extract_abstract(text: str) -> str:
     lines = text.splitlines()
-    positions = find_section_positions(lines)
     start = None
-    for key in ["abstract"]:
-        for i, line in enumerate(lines):
-            if normalize(line).lower().rstrip(":") == key:
-                start = i
-                break
+    for i, line in enumerate(lines):
+        norm = normalize(line).lower().rstrip(":")
+        if norm in ("abstract", "1. abstract"):
+            start = i
+            break
+
     if start is None:
-        # Fall back to text between an "Abstract:" marker and Keywords.
         m = re.search(r"(?is)\babstract\s*:\s*(.*?)(?:\bkeywords\s*:|$)", text)
         return normalize(m.group(1)) if m else ""
+
     end_candidates = [
         i for i, line in enumerate(lines)
-        if i > start and normalize(line).lower().startswith("keywords")
+        if i > start and (
+            normalize(line).lower().startswith("keywords") or
+            normalize(line).lower().startswith("1. introduction") or
+            normalize(line).lower() == "introduction"
+        )
     ]
     end = min(end_candidates) if end_candidates else len(lines)
     value = "\n".join(lines[start + 1:end]).strip()
@@ -191,12 +195,13 @@ def extract_abstract(text: str) -> str:
 
 def extract_keywords(text: str) -> List[str]:
     m = re.search(
-        r"(?is)\bkeywords?\s*:\s*(.*?)(?=\n\s*(?:1\.?\s+)?introduction\b|\n\s*abstract\b|$)",
+        r"(?is)\bkeywords?\s*:\s*(.*?)(?=\n\s*(?:1\.?\s+)?introduction\b|\n\s*abstract\b|\n\s*\n\s*[A-Z]|$)",
         text,
     )
     if not m:
         return []
-    raw = m.group(1).strip().splitlines()[0]
+    # Join multi-line keywords before splitting
+    raw = " ".join([line.strip() for line in m.group(1).strip().splitlines() if line.strip()])
     return [normalize(x) for x in re.split(r"[;,]", raw) if normalize(x)]
 
 
@@ -211,25 +216,6 @@ def extract_domain_statement(text: str) -> str:
     return normalize(section)
 
 
-def extract_author_block(text: str) -> str:
-    """Return the front-matter region between title and abstract.
-
-    Used only for COI/blind-review processing. It is never sent to the
-    reviewer-search prompt as an instruction to invent names.
-    """
-    lines = [x for x in text.splitlines()]
-    abstract_idx = None
-    for i, line in enumerate(lines):
-        if re.match(r"(?i)^\s*abstract\s*:?\s*$", line) or re.match(
-            r"(?i)^\s*abstract\s*:", line
-        ):
-            abstract_idx = i
-            break
-    if abstract_idx is None:
-        return ""
-    return "\n".join(lines[:abstract_idx])
-
-
 # ============================================================
 # FILE EXTRACTION
 # ============================================================
@@ -241,15 +227,12 @@ def extract_text(uploaded_file) -> str:
     if name.endswith(".docx"):
         doc = Document(io.BytesIO(data))
         parts = []
-
         for p in doc.paragraphs:
             if p.text.strip():
                 parts.append(p.text)
-
         for table in doc.tables:
             for row in table.rows:
                 parts.append(" | ".join(cell.text.strip() for cell in row.cells))
-
         return "\n".join(parts)
 
     if name.endswith(".pdf"):
@@ -259,7 +242,7 @@ def extract_text(uploaded_file) -> str:
                 pages.append(page.extract_text() or "")
         return "\n".join(pages)
 
-    raise ValueError("Unsupported file type.")
+    raise ValueError("Unsupported file type. Please upload a .docx or .pdf file.")
 
 
 # ============================================================
@@ -269,12 +252,13 @@ def extract_text(uploaded_file) -> str:
 def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
     checks = []
     lower = text.lower()
+    lines = text.splitlines()
 
     abstract = extract_abstract(text)
     keywords = extract_keywords(text)
-    positions = find_section_positions(text.splitlines())
+    positions = find_section_positions(lines)
 
-    # Abstract
+    # 1. Abstract check
     if not abstract:
         checks.append({
             "requirement": "Abstract",
@@ -289,10 +273,10 @@ def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
             "requirement": "Abstract ≤ 200 words",
             "status": status,
             "evidence": f"Detected approximately {n} words.",
-            "action": "Keep the abstract at or below 200 words." if status == "FAIL" else "No action required.",
+            "action": "Keep abstract at or below 200 words." if status == "FAIL" else "No action required.",
         })
 
-    # Keywords
+    # 2. Keywords check
     if MRJ_RULES["keywords_min"] <= len(keywords) <= MRJ_RULES["keywords_max"]:
         keyword_status = "PASS"
         keyword_action = "No action required."
@@ -301,7 +285,7 @@ def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
         keyword_action = "Add 3–10 pertinent keywords."
     else:
         keyword_status = "FAIL"
-        keyword_action = "Use 3–10 pertinent keywords."
+        keyword_action = "Adjust keywords count to between 3 and 10."
     checks.append({
         "requirement": "3–10 keywords",
         "status": keyword_status,
@@ -309,7 +293,7 @@ def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
         "action": keyword_action,
     })
 
-    # Required sections
+    # 3. Required sections check
     required_map = [
         ("Introduction", "introduction"),
         ("Materials and Methods", "materials and methods"),
@@ -329,71 +313,72 @@ def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
             "requirement": f"Required section: {label}",
             "status": "PASS" if exists else "FAIL",
             "evidence": "Section heading detected." if exists else "Section heading not detected.",
-            "action": "No action required." if exists else f"Add the '{label}' section required by the MRJ template.",
+            "action": "No action required." if exists else f"Add the '{label}' section required by MRJ.",
         })
 
-    # Domains
+    # 4. Multidisciplinary domains check
     domain_statement = extract_domain_statement(text)
-    domain_matches = re.findall(r"\([a-z]\)\s*([^,;.]+)", domain_statement, flags=re.I)
+    domain_matches = re.findall(r"(?:\([a-z0-9]+\)|\b\d+\.|\*|-)\s*([^,;.\n]+)", domain_statement, flags=re.I)
     domain_count = len(domain_matches)
     if domain_count >= MRJ_RULES["minimum_domains"]:
         domain_status = "PASS"
         domain_action = "No action required."
     else:
         domain_status = "WARN" if domain_statement else "FAIL"
-        domain_action = "State at least two research domains using the MRJ domain statement."
+        domain_action = "Explicitly list at least two domains in the Multidisciplinary Domains statement."
 
     checks.append({
         "requirement": "At least two multidisciplinary domains",
         "status": domain_status,
-        "evidence": f"Detected {domain_count} explicit domain item(s)." if domain_statement else "No MRJ domain statement detected.",
+        "evidence": f"Detected {domain_count} domain items." if domain_statement else "No domain statement detected.",
         "action": domain_action,
     })
 
-    # Citation style
-    body_before_refs = text[: text.lower().find("references")] if "references" in lower else text
+    # 5. Citation style check (using last reference index to avoid early false match)
+    ref_pos = positions.get("references")
+    if ref_pos is not None:
+        body_before_refs = "\n".join(lines[:ref_pos])
+    else:
+        last_ref_idx = lower.rfind("references")
+        body_before_refs = text[:last_ref_idx] if last_ref_idx != -1 else text
+
     numbered_citations = re.findall(r"\[(\d+(?:\s*[-–,]\s*\d+)*)\]", body_before_refs)
     citation_status = "PASS" if numbered_citations else "WARN"
     checks.append({
         "requirement": "Numbered square-bracket citations",
         "status": citation_status,
         "evidence": f"Detected {len(numbered_citations)} square-bracket citation pattern(s).",
-        "action": "Check that references are numbered in order of appearance and citations use square brackets.",
+        "action": "Check that citations follow sequential square-bracket formatting (e.g., [1, 2]).",
     })
 
-    # Ethical approval
+    # 6. Ethical approval check
     methods = extract_section_text(text, "materials and methods").lower()
     ethical_terms = [
-        "ethics approval",
-        "ethical approval",
-        "ethics committee",
-        "institutional review board",
-        "irb",
-        "approval code",
-        "ethical clearance",
+        "ethics approval", "ethical approval", "ethics committee",
+        "institutional review board", "irb", "approval code", "ethical clearance"
     ]
     ethics_relevant = any(
         term in (methods + " " + lower) for term in
-        ["human", "patient", "participant", "animal", "clinical", "intervention"]
+        ["human", "patient", "participant", "animal", "clinical", "intervention", "survey"]
     )
     if ethics_relevant:
         ethics_found = any(term in methods for term in ethical_terms)
         checks.append({
-            "requirement": "Ethics approval where applicable",
+            "requirement": "Ethics approval statement",
             "status": "PASS" if ethics_found else "WARN",
-            "evidence": "Potential human/animal/intervention study language detected; ethics wording was " +
-                        ("detected." if ethics_found else "not detected in Materials and Methods."),
-            "action": "Verify that the approving authority and approval code are stated where required.",
+            "evidence": "Study involves human/animal/participant subjects; ethics wording was " +
+                        ("detected in Methods." if ethics_found else "NOT clearly identified in Materials and Methods."),
+            "action": "Verify IRB/ethics committee name and protocol approval code are clearly specified.",
         })
 
-    # DOI presence in references
+    # 7. DOI check
     references = extract_section_text(text, "references")
     doi_count = len(re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", references, flags=re.I))
     checks.append({
-        "requirement": "DOI included for references where available",
-        "status": "PASS" if doi_count else "WARN",
-        "evidence": f"Detected {doi_count} DOI-like reference string(s).",
-        "action": "Verify DOI information for references where a DOI exists.",
+        "requirement": "DOI inclusion in references",
+        "status": "PASS" if doi_count > 0 else "WARN",
+        "evidence": f"Detected {doi_count} DOI reference pattern(s).",
+        "action": "Verify that digital object identifiers (DOIs) are supplied where available.",
     })
 
     return checks
@@ -405,156 +390,239 @@ def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
 
 STATUS_VALUES = ["PASS", "CONCERN", "MAJOR CONCERN", "NOT ASSESSABLE"]
 
-
 def assessment_schema(name: str, properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
-    return {"name": name, "strict": True, "schema": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}}
+    return {
+        "name": name,
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+    }
+
+ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": STATUS_VALUES},
+        "finding": {"type": "string"},
+        "evidence": {"type": "string"},
+        "action": {"type": "string"},
+    },
+    "required": ["status", "finding", "evidence", "action"],
+    "additionalProperties": False,
+}
+
+AI_CALL_1_SCHEMA = assessment_schema(
+    "mrj_scope_abstract_introduction",
+    {
+        "research_area": {"type": "string"},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "research_question": ITEM_SCHEMA,
+        "abstract": ITEM_SCHEMA,
+        "introduction_novelty": ITEM_SCHEMA,
+    },
+    ["research_area", "keywords", "research_question", "abstract", "introduction_novelty"],
+)
+
+AI_CALL_2_SCHEMA = assessment_schema(
+    "mrj_methodology_statistics_ethics",
+    {
+        "methodology": ITEM_SCHEMA,
+        "statistics": ITEM_SCHEMA,
+        "ethics_reproducibility": ITEM_SCHEMA,
+    },
+    ["methodology", "statistics", "ethics_reproducibility"],
+)
+
+AI_CALL_3_SCHEMA = assessment_schema(
+    "mrj_results_discussion_conclusion",
+    {
+        "results": ITEM_SCHEMA,
+        "discussion": ITEM_SCHEMA,
+        "conclusion": ITEM_SCHEMA,
+        "abstract_conclusion_alignment": ITEM_SCHEMA,
+        "reference_use": ITEM_SCHEMA,
+        "major_red_flags": {"type": "array", "items": {"type": "string"}},
+        "editorial_recommendation": {
+            "type": "string",
+            "enum": ["Proceed to editorial review", "Needs author correction", "Major concern"],
+        },
+    },
+    [
+        "results", "discussion", "conclusion",
+        "abstract_conclusion_alignment", "reference_use",
+        "major_red_flags", "editorial_recommendation"
+    ],
+)
 
 
-ITEM_SCHEMA = {"type": "object", "properties": {
-    "status": {"type": "string", "enum": STATUS_VALUES}, "finding": {"type": "string"},
-    "evidence": {"type": "string"}, "action": {"type": "string"}},
-    "required": ["status", "finding", "evidence", "action"], "additionalProperties": False}
-
-AI_CALL_1_SCHEMA = assessment_schema("mrj_scope_abstract_introduction", {
-    "research_area": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}},
-    "research_question": ITEM_SCHEMA, "abstract": ITEM_SCHEMA, "introduction_novelty": ITEM_SCHEMA},
-    ["research_area", "keywords", "research_question", "abstract", "introduction_novelty"])
-AI_CALL_2_SCHEMA = assessment_schema("mrj_methodology_statistics_ethics", {
-    "methodology": ITEM_SCHEMA, "statistics": ITEM_SCHEMA, "ethics_reproducibility": ITEM_SCHEMA},
-    ["methodology", "statistics", "ethics_reproducibility"])
-AI_CALL_3_SCHEMA = assessment_schema("mrj_results_discussion_conclusion", {
-    "results": ITEM_SCHEMA, "discussion": ITEM_SCHEMA, "conclusion": ITEM_SCHEMA,
-    "abstract_conclusion_alignment": ITEM_SCHEMA, "reference_use": ITEM_SCHEMA,
-    "major_red_flags": {"type": "array", "items": {"type": "string"}},
-    "editorial_recommendation": {"type": "string", "enum": ["Proceed to editorial review", "Needs author correction", "Major concern"]}},
-    ["results", "discussion", "conclusion", "abstract_conclusion_alignment", "reference_use", "major_red_flags", "editorial_recommendation"])
-
-
-def _groq_json_call(client: Groq, schema: Dict[str, Any], prompt: str, max_tokens: int = 1200) -> Dict[str, Any]:
-    """Call Groq Structured Outputs with enough budget for GPT-OSS JSON generation."""
-    request = dict(
-        model=GROQ_MODEL,
+def _groq_json_call(client: Groq, model: str, schema: Dict[str, Any], prompt: str, max_tokens: int = 2000) -> Dict[str, Any]:
+    """Call Groq API with structured JSON output and automatic retry on budget overrun."""
+    request_params = dict(
+        model=model,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a cautious academic journal pre-screening assistant. "
-                    "Assess only evidence supplied. Never invent facts, citations, "
-                    "authors, reviewers, institutions, sample sizes, results, "
-                    "statistical tests, ethics approvals, or research questions. "
-                    "If evidence is missing, use NOT ASSESSABLE. Do not rewrite "
-                    "manuscript text. Keep findings, evidence, and actions concise. "
-                    "Return only the JSON required by the schema."
+                    "You are a strict, cautious academic pre-screening editorial assistant. "
+                    "Base your assessment entirely on the provided excerpt. Never invent citations, results, "
+                    "institutions, or facts. If evidence is absent, use NOT ASSESSABLE. Keep findings concise. "
+                    "Output strictly valid JSON complying with the provided schema."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0,
-        reasoning_effort="low",
-        include_reasoning=False,
+        temperature=0.1,
         max_completion_tokens=max_tokens,
         response_format={"type": "json_schema", "json_schema": schema},
     )
 
     try:
-        response = client.chat.completions.create(**request)
+        response = client.chat.completions.create(**request_params)
     except Exception as exc:
-        # If GPT-OSS exhausts its completion budget before constrained JSON is
-        # complete, retry once with a larger completion budget.
         msg = str(exc).lower()
-        if "max completion tokens" not in msg and "json_validate_failed" not in msg:
-            raise
-        request["max_completion_tokens"] = max(2400, max_tokens * 2)
-        response = client.chat.completions.create(**request)
+        if "max completion tokens" in msg or "json_validate_failed" in msg:
+            request_params["max_completion_tokens"] = 3500
+            response = client.chat.completions.create(**request_params)
+        else:
+            raise exc
 
     return json.loads(response.choices[0].message.content or "{}")
 
 
 def _ai_not_assessed(reason: str) -> Dict[str, Any]:
-    item = {"status": "NOT ASSESSABLE", "finding": reason, "evidence": "", "action": "Review this item manually."}
-    keys = ["research_question","abstract","introduction_novelty","methodology","statistics","ethics_reproducibility","results","discussion","conclusion","abstract_conclusion_alignment","reference_use"]
-    return {"summary": reason, "research_area": "Not assessed", "keywords": [], **{k: item.copy() for k in keys}, "major_red_flags": [reason], "editorial_recommendation": "Needs author correction"}
+    item = {"status": "NOT ASSESSABLE", "finding": reason, "evidence": "", "action": "Review manually."}
+    keys = [
+        "research_question", "abstract", "introduction_novelty", "methodology",
+        "statistics", "ethics_reproducibility", "results", "discussion",
+        "conclusion", "abstract_conclusion_alignment", "reference_use"
+    ]
+    return {
+        "summary": reason,
+        "research_area": "Not assessed",
+        "keywords": [],
+        **{k: item.copy() for k in keys},
+        "major_red_flags": [reason],
+        "editorial_recommendation": "Needs author correction",
+    }
 
 
 def _compact_rule_summary(checks: List[Dict[str, Any]]) -> str:
     return "\n".join(f"- {c['requirement']}: {c['status']} — {c['evidence']}" for c in checks)
 
 
-def run_ai_analysis(text: str, deterministic_checks: List[Dict[str, Any]], client: Groq) -> Dict[str, Any]:
-    """Run three focused AI assessments instead of one oversized manuscript prompt."""
-    abstract = extract_abstract(text); intro = extract_section_text(text, "introduction")
-    methods = extract_section_text(text, "materials and methods"); rd = extract_section_text(text, "results and discussion")
-    conclusion = extract_section_text(text, "conclusions"); refs = extract_section_text(text, "references")
+def run_ai_analysis(
+    text: str,
+    deterministic_checks: List[Dict[str, Any]],
+    client: Groq,
+    model: str = DEFAULT_GROQ_MODEL
+) -> Dict[str, Any]:
+    """Execute three focused, parallel AI assessments for low latency."""
+    abstract = extract_abstract(text)
+    intro = extract_section_text(text, "introduction")
+    methods = extract_section_text(text, "materials and methods")
+    rd = extract_section_text(text, "results and discussion")
+    conclusion = extract_section_text(text, "conclusions")
+    refs = extract_section_text(text, "references")
     rules = _compact_rule_summary(deterministic_checks)
-    try:
-        prompt1 = f"""MRJ PRE-SCREEN: RESEARCH QUESTION, ABSTRACT, INTRODUCTION
 
-MRJ CHECKS:
-{rules[:3500]}
+    prompt1 = f"""MRJ PRE-SCREEN: RESEARCH QUESTION, ABSTRACT, INTRODUCTION
+MRJ DETERMINISTIC CHECKS:
+{rules[:3000]}
 
 ABSTRACT:
-{abstract[:2600]}
+{abstract[:2500]}
 
 INTRODUCTION:
-{intro[:3800]}
+{intro[:3500]}
 
-Assess: explicit research question/objective; abstract coverage of background, methods, results and conclusion; and whether the introduction establishes a supported gap/objective/novelty. Extract a concise research area and useful search keywords. Never infer missing facts. Use NOT ASSESSABLE when evidence is insufficient."""
-        a = _groq_json_call(client, AI_CALL_1_SCHEMA, prompt1, 1200)
-        prompt2 = f"""MRJ PRE-SCREEN: METHODOLOGY, STATISTICS, ETHICS
+Assess: explicit research question/objective; abstract components; and introduction gap/novelty. Extract specific research area and 3-5 search keywords."""
 
-MRJ CHECKS:
-{rules[:3500]}
+    prompt2 = f"""MRJ PRE-SCREEN: METHODOLOGY, STATISTICS, ETHICS
+MRJ DETERMINISTIC CHECKS:
+{rules[:3000]}
 
 MATERIALS AND METHODS:
 {methods[:5000]}
 
-Assess methodology completeness/reproducibility; appropriateness and reporting of statistics/data analysis; and ethics/consent/animal/reproducibility information where relevant. Do not invent missing sample sizes, tests or approvals. Use NOT ASSESSABLE when evidence is insufficient."""
-        b = _groq_json_call(client, AI_CALL_2_SCHEMA, prompt2, 1200)
-        prompt3 = f"""MRJ PRE-SCREEN: RESULTS, DISCUSSION, CONCLUSION, REFERENCES
+Assess: methodology completeness and reproducibility; appropriateness of statistics/data analysis; and ethics/IRB approvals if applicable."""
 
+    prompt3 = f"""MRJ PRE-SCREEN: RESULTS, DISCUSSION, CONCLUSION, REFERENCES
 ABSTRACT:
-{abstract[:2200]}
+{abstract[:2000]}
 
 RESULTS AND DISCUSSION:
-{rd[:5200]}
+{rd[:5000]}
 
 CONCLUSIONS:
-{conclusion[:2200]}
+{conclusion[:2000]}
 
 REFERENCES:
-{refs[:2400]}
+{refs[:2500]}
 
-Assess whether results answer the objective; discussion interprets rather than merely repeats; conclusion is supported and appropriately limited; abstract/conclusion are aligned; and citations/references are used coherently. Do not verify reference facts from memory. List only evidence-supported major red flags. Give a pre-screening recommendation, not an acceptance/rejection decision."""
-        c = _groq_json_call(client, AI_CALL_3_SCHEMA, prompt3, 1400)
-        out = {}; out.update(a); out.update(b); out.update(c)
-        assess_keys = ["research_question","abstract","introduction_novelty","methodology","statistics","ethics_reproducibility","results","discussion","conclusion","abstract_conclusion_alignment","reference_use"]
+Assess: whether results address the research question; discussion interprets rather than merely re-states; conclusions are supported; citation coherence. List evidence-backed red flags."""
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            fut1 = executor.submit(_groq_json_call, client, model, AI_CALL_1_SCHEMA, prompt1, 2000)
+            fut2 = executor.submit(_groq_json_call, client, model, AI_CALL_2_SCHEMA, prompt2, 2000)
+            fut3 = executor.submit(_groq_json_call, client, model, AI_CALL_3_SCHEMA, prompt3, 2200)
+
+            res1 = fut1.result()
+            res2 = fut2.result()
+            res3 = fut3.result()
+
+        out = {}
+        out.update(res1)
+        out.update(res2)
+        out.update(res3)
+
+        assess_keys = [
+            "research_question", "abstract", "introduction_novelty",
+            "methodology", "statistics", "ethics_reproducibility",
+            "results", "discussion", "conclusion",
+            "abstract_conclusion_alignment", "reference_use"
+        ]
         concern_count = sum(out.get(k, {}).get("status") in ("CONCERN", "MAJOR CONCERN") for k in assess_keys)
-        out["summary"] = (f"Focused AI assessment completed across 11 scientific areas; {concern_count} area(s) were flagged as CONCERN or MAJOR CONCERN. Objective MRJ compliance remains based on deterministic checks." if concern_count else "Focused AI assessment completed across 11 scientific areas. No CONCERN or MAJOR CONCERN item was flagged from the supplied evidence; this does not replace peer review.")
+        out["summary"] = (
+            f"Focused AI screening completed across 11 key scientific facets. {concern_count} item(s) flagged with concerns."
+            if concern_count else
+            "Focused AI assessment completed across 11 scientific areas. No critical methodological or structural red flags identified."
+        )
         return out
+
     except Exception as exc:
         msg = str(exc)
         if "413" in msg or "tokens per minute" in msg.lower():
-            return _ai_not_assessed("Groq rate limit was reached. Deterministic MRJ checks remain valid and the manuscript was not modified.")
-        return _ai_not_assessed(f"Structured AI assessment failed: {msg}")
+            return _ai_not_assessed("Groq rate limit encountered. Deterministic checks remain valid.")
+        return _ai_not_assessed(f"AI assessment failed: {msg}")
 
 
 def _format_ai_item(item: Dict[str, Any]) -> str:
-    return "\n".join([f"Status: {item.get('status', 'NOT ASSESSABLE')}", f"Finding: {item.get('finding', '')}", f"Evidence: {item.get('evidence', '') or 'Not supplied.'}", f"Action: {item.get('action', '') or 'Manual review required.'}"])
+    return (
+        f"Status: {item.get('status', 'NOT ASSESSABLE')}\n"
+        f"Finding: {item.get('finding', '')}\n"
+        f"Evidence: {item.get('evidence', '') or 'Not supplied.'}\n"
+        f"Action: {item.get('action', '') or 'Manual review required.'}"
+    )
 
 
 # ============================================================
-# REVIEWER SEARCH: OPENALEX
+# REVIEWER SEARCH: OPENALEX (OPTIMIZED)
 # ============================================================
 
 def openalex_get(url: str, params: Dict[str, Any], mailto: str = "") -> Dict[str, Any]:
     if mailto:
         params = dict(params)
         params["mailto"] = mailto
-    response = requests.get(url, params=params, timeout=30)
+    response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
     return response.json()
 
 
+@lru_cache(maxsize=256)
 def get_openalex_author(author_id: str, mailto: str = "") -> Dict[str, Any]:
     try:
         return openalex_get(f"{OPENALEX_AUTHOR_URL}/{author_id}", {}, mailto)
@@ -562,31 +630,13 @@ def get_openalex_author(author_id: str, mailto: str = "") -> Dict[str, Any]:
         return {}
 
 
-def institution_location_text(inst: Dict[str, Any]) -> str:
-    if not inst:
-        return ""
-    country = (inst.get("country_code") or "").lower()
-    display = inst.get("display_name") or ""
-    geo = inst.get("geo") or {}
-    return " ".join(
-        str(x or "") for x in [
-            display,
-            country,
-            geo.get("city"),
-            geo.get("region"),
-        ]
-    ).lower()
-
-
 def candidate_region_match(candidate: Dict[str, Any], region: str) -> bool:
-    text = " ".join(
-        [
-            candidate.get("institution", ""),
-            candidate.get("city", ""),
-            candidate.get("region", ""),
-            candidate.get("country", ""),
-        ]
-    ).lower()
+    text = " ".join([
+        str(candidate.get("institution") or ""),
+        str(candidate.get("city") or ""),
+        str(candidate.get("region") or ""),
+        str(candidate.get("country") or ""),
+    ]).lower()
 
     if region == "India":
         return candidate.get("country", "").lower() == "in" or "india" in text
@@ -600,25 +650,32 @@ def candidate_region_match(candidate: Dict[str, Any], region: str) -> bool:
     return False
 
 
-def search_openalex_reviewers(
-    search_terms: List[str],
-    region: str,
+def reviewer_search_report(
+    ai_data: Dict[str, Any],
     mailto: str = "",
-    max_candidates: int = 6,
-) -> List[Dict[str, Any]]:
-    query = " ".join(search_terms[:8]).strip()
-    if not query:
-        return []
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Single-pass OpenAlex query with author-level caching and regional partitioning."""
+    terms = ai_data.get("keywords", [])[:4] + [ai_data.get("research_area", "")]
+    terms = [normalize(x) for x in terms if normalize(x)]
+    query = " ".join(terms[:5]).strip()
 
-    data = openalex_get(
-        OPENALEX_URL,
-        {
-            "search": query,
-            "per-page": 40,
-            "sort": "publication_year:desc",
-        },
-        mailto,
-    )
+    output = {"India": [], "Northeast India": [], "Assam": []}
+    if not query:
+        return output
+
+    try:
+        data = openalex_get(
+            OPENALEX_URL,
+            {
+                "search": query,
+                "per-page": 50,
+                "sort": "publication_year:desc",
+            },
+            mailto,
+        )
+    except Exception as exc:
+        err = [{"error": f"OpenAlex search failed: {exc}"}]
+        return {k: err for k in output}
 
     candidates: Dict[str, Dict[str, Any]] = {}
 
@@ -643,110 +700,68 @@ def search_openalex_reviewers(
             for inst in institutions:
                 inst_name = inst.get("display_name") or ""
                 inst_country = inst.get("country_code") or ""
+                geo = inst.get("geo") or {}
 
-                candidate = {
-                    "author_id": author_id,
-                    "name": author_name,
-                    "institution": inst_name,
-                    "country": inst_country,
-                    "city": ((inst.get("geo") or {}).get("city") or ""),
-                    "region": ((inst.get("geo") or {}).get("region") or ""),
-                    "recent_publications": [],
-                    "score": 0.0,
-                }
+                if author_id not in candidates:
+                    candidates[author_id] = {
+                        "author_id": author_id,
+                        "name": author_name,
+                        "institution": inst_name,
+                        "country": inst_country,
+                        "city": geo.get("city") or "",
+                        "region": geo.get("region") or "",
+                        "recent_publications": [],
+                        "score": 0.0,
+                    }
 
-                if not candidate_region_match(candidate, region):
-                    continue
-
-                key = author_id
-                if key not in candidates:
-                    candidates[key] = candidate
-
-                rec = candidates[key]
+                rec = candidates[author_id]
                 rec["recent_publications"].append({
                     "title": title,
                     "year": year,
                     "doi": doi,
                     "cited_by_count": cited,
                 })
+                rec["score"] += max(0, year - 2018) * 0.8 + min(cited, 100) * 0.03
 
-                # Recent publication + citation evidence, not fabricated expertise.
-                rec["score"] += max(0, year - 2018) * 0.8
-                rec["score"] += min(cited, 100) * 0.03
+    # Resolve affiliations only for top scoring candidate pool (max 25)
+    top_candidates = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:25]
+    for c in top_candidates:
+        author_meta = get_openalex_author(c["author_id"], mailto)
+        last_known = (author_meta.get("last_known_institutions") or [{}])[0]
+        geo = last_known.get("geo") or {}
 
-    results = list(candidates.values())
+        c["last_known_institution"] = last_known.get("display_name") or c["institution"]
+        c["last_known_country"] = last_known.get("country_code") or c["country"]
+        c["last_known_city"] = geo.get("city") or c["city"]
+        c["last_known_region"] = geo.get("region") or c["region"]
 
-    # Try to use the author's last-known institution as an additional verification signal.
-    for candidate in results[:30]:
-        author = get_openalex_author(candidate["author_id"], mailto)
-        last_known = author.get("last_known_institutions") or []
-        if last_known:
-            lk = last_known[0]
-            candidate["last_known_institution"] = lk.get("display_name") or candidate["institution"]
-            candidate["last_known_country"] = lk.get("country_code") or candidate["country"]
-            candidate["last_known_city"] = ((lk.get("geo") or {}).get("city") or candidate["city"])
-            candidate["last_known_region"] = ((lk.get("geo") or {}).get("region") or candidate["region"])
-        else:
-            candidate["last_known_institution"] = candidate["institution"]
-            candidate["last_known_country"] = candidate["country"]
-            candidate["last_known_city"] = candidate["city"]
-            candidate["last_known_region"] = candidate["region"]
+    # Filter into regional buckets locally
+    for reg in ["Assam", "Northeast India", "India"]:
+        matched = []
+        for c in top_candidates:
+            check_obj = {
+                "institution": c["last_known_institution"],
+                "country": c["last_known_country"],
+                "city": c["last_known_city"],
+                "region": c["last_known_region"],
+            }
+            if candidate_region_match(check_obj, reg):
+                c["verification_note"] = "OpenAlex last-known affiliation matches region."
+                matched.append(c)
+            elif candidate_region_match(c, reg):
+                c["verification_note"] = "Historical publication affiliation matches region."
+                matched.append(c)
 
-    # Re-check region against last-known institution where possible.
-    verified = []
-    for candidate in results:
-        check_candidate = dict(candidate)
-        check_candidate["institution"] = candidate["last_known_institution"]
-        check_candidate["country"] = candidate["last_known_country"]
-        check_candidate["city"] = candidate["last_known_city"]
-        check_candidate["region"] = candidate["last_known_region"]
+        matched.sort(
+            key=lambda x: (
+                len(x["recent_publications"]),
+                x["score"],
+                max((p["year"] for p in x["recent_publications"]), default=0),
+            ),
+            reverse=True,
+        )
+        output[reg] = matched[:6]
 
-        if candidate_region_match(check_candidate, region):
-            candidate["verification_note"] = (
-                "OpenAlex publication affiliation plus last-known institution match."
-            )
-            verified.append(candidate)
-        else:
-            # Keep the publication evidence but make the uncertainty explicit.
-            candidate["verification_note"] = (
-                "Publication-associated affiliation matched the requested region; "
-                "current affiliation could not be independently confirmed."
-            )
-            if region == "India" and candidate["country"] == "in":
-                verified.append(candidate)
-
-    verified.sort(
-        key=lambda x: (
-            len(x["recent_publications"]),
-            x["score"],
-            max((p["year"] for p in x["recent_publications"]), default=0),
-        ),
-        reverse=True,
-    )
-
-    return verified[:max_candidates]
-
-
-def reviewer_search_report(
-    ai_data: Dict[str, Any],
-    mailto: str = "",
-) -> Dict[str, List[Dict[str, Any]]]:
-    terms = ai_data.get("keywords", []) + [ai_data.get("research_area", "")]
-    terms = [normalize(x) for x in terms if normalize(x)]
-
-    output = {}
-    for region in ["India", "Northeast India", "Assam"]:
-        try:
-            output[region] = search_openalex_reviewers(
-                terms,
-                region,
-                mailto=mailto,
-                max_candidates=6,
-            )
-        except Exception as exc:
-            output[region] = [{
-                "error": f"OpenAlex search failed: {exc}"
-            }]
     return output
 
 
@@ -760,62 +775,45 @@ PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)")
 URL_RE = re.compile(r"https?://\S+", re.I)
 
 IDENTIFYING_LABELS = [
-    "correspondence",
-    "corresponding author",
-    "email",
-    "orcid",
-    "scopus author id",
-    "affiliation",
-    "department of",
-    "faculty of",
-    "university",
-    "institute",
-    "institution",
-    "hospital",
-    "laboratory",
-    "research centre",
-    "research center",
-    "address",
-    "postal",
-    "street",
+    "correspondence", "corresponding author", "email", "orcid",
+    "scopus author id", "affiliation", "department of", "faculty of",
+    "university", "institute", "hospital", "laboratory",
+    "address", "postal"
 ]
+
+REMOVABLE_SECTIONS = {
+    "funding", "acknowledgments", "acknowledgements",
+    "author contributions", "author's contributions", "authors' contributions",
+    "competing interests", "biography", "about the authors",
+}
 
 
 def delete_paragraph(paragraph: Paragraph) -> None:
     p = paragraph._element
-    p.getparent().remove(p)
-    paragraph._p = paragraph._element = None
+    if p is not None and p.getparent() is not None:
+        p.getparent().remove(p)
 
 
 def paragraph_is_identifying(text: str) -> bool:
     low = normalize(text).lower()
     if not low:
         return False
-
-    # These are safe to remove wherever they occur.
     if EMAIL_RE.search(text) or ORCID_RE.search(text):
         return True
-
-    # Avoid deleting normal scientific/reference prose merely because it mentions
-    # an institution. Standalone metadata blocks are normally short.
     if len(text) <= 180 and any(label in low for label in IDENTIFYING_LABELS):
         return True
-
-    # Author/affiliation lines with superscript-style numbering in front matter.
-    if re.search(r"\b\d+\s*[,;]\s*", text) and len(text) < 300:
+    if re.search(r"\b\d+\s*[,;]\s*", text) and len(text) < 250 and any(w in low for w in ["dept", "department", "univ"]):
         return True
-
     return False
 
 
 def redact_run_text(text: str) -> str:
     if not text:
         return text
-    text = EMAIL_RE.sub("[REDACTED]", text)
-    text = ORCID_RE.sub("[REDACTED]", text)
-    text = PHONE_RE.sub("[REDACTED]", text)
-    # URLs can expose institutional pages or profiles.
-    text = URL_RE.sub("[REDACTED]", text)
+    text = EMAIL_RE.sub("[REDACTED EMAIL]", text)
+    text = ORCID_RE.sub("[REDACTED ORCID]", text)
+    text = PHONE_RE.sub("[REDACTED PHONE]", text)
+    text = URL_RE.sub("[REDACTED LINK]", text)
     return text
 
 
@@ -823,13 +821,11 @@ def iter_all_paragraphs(doc: Document):
     for p in doc.paragraphs:
         if p is not None:
             yield p
-
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     yield p
-
     for section in doc.sections:
         for container in [section.header, section.footer]:
             for p in container.paragraphs:
@@ -839,7 +835,7 @@ def iter_all_paragraphs(doc: Document):
 def blind_copy_docx(original_bytes: bytes) -> bytes:
     doc = Document(io.BytesIO(original_bytes))
 
-    # 1. Remove core metadata that can expose the author.
+    # 1. Clear core metadata
     props = doc.core_properties
     props.author = ""
     props.last_modified_by = ""
@@ -847,75 +843,42 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
     props.subject = ""
     props.keywords = ""
 
-    # 2. Determine the abstract boundary.
+    # 2. Identify Abstract boundary
     body_paragraphs = list(doc.paragraphs)
     abstract_idx = None
     for i, p in enumerate(body_paragraphs):
-        if p is None:
-            continue
         if re.match(r"(?i)^\s*abstract\s*:?", p.text.strip()):
             abstract_idx = i
             break
 
-    # 3. In the front matter, preserve the title but remove the author block.
-    #    We keep the first substantial paragraph as the title and remove everything
-    #    else before Abstract. This avoids trying to guess author names with AI.
+    # 3. Retain first paragraph (Title) and delete front-matter authors/affiliations
     if abstract_idx is not None:
-        nonempty_before = [
-            (i, p) for i, p in enumerate(body_paragraphs[:abstract_idx])
-            if p is not None and p.text.strip()
-        ]
-
+        nonempty_before = [(i, p) for i, p in enumerate(body_paragraphs[:abstract_idx]) if p.text.strip()]
         if nonempty_before:
             title_idx = nonempty_before[0][0]
             for i, p in enumerate(body_paragraphs[:abstract_idx]):
-                if i == title_idx:
-                    continue
-                if p is not None and p.text.strip():
+                if i != title_idx and p.text.strip():
                     delete_paragraph(p)
 
-    # 4. Remove identifying standalone paragraphs throughout the document.
-    #    Do not alter scientific prose simply because it contains a word like
-    #    "university" in a reference or methods sentence; only standalone
-    #    identifying blocks are deleted here.
+    # 4. Remove standalone identifying paragraphs
     for p in list(iter_all_paragraphs(doc)):
-        if p._element.getparent() is None:
-            continue
         txt = p.text.strip()
-        if not txt:
-            continue
-        if paragraph_is_identifying(txt):
+        if txt and paragraph_is_identifying(txt):
             delete_paragraph(p)
 
-    # 5. Remove sections commonly used to identify authors/funding.
-    #    This is conservative for blind review: no replacement prose is inserted.
-    removable_section_starts = {
-        "funding",
-        "acknowledgments",
-        "acknowledgements",
-    }
-
+    # 5. Remove funding, acknowledgment, and contribution sections
     paragraphs = [p for p in doc.paragraphs if p is not None]
     for i, p in enumerate(paragraphs):
-        if p._element is None or p._element.getparent() is None:
-            continue
         heading = normalize(p.text).lower().rstrip(":")
-        if heading not in removable_section_starts:
-            continue
-
-        # Delete heading and following paragraphs until the next obvious heading.
-        delete_paragraph(p)
-        for q in paragraphs[i + 1:]:
-            if q is None or q._element is None or q._element.getparent() is None:
-                continue
-            qtxt = normalize(q.text)
-            if re.match(r"^(?:\d+(?:\.\d+)*)?\s*[A-Z][A-Za-z &/-]{2,60}$", qtxt):
-                break
-            if q._element.getparent() is not None:
+        if heading in REMOVABLE_SECTIONS:
+            delete_paragraph(p)
+            for q in paragraphs[i + 1:]:
+                qtxt = normalize(q.text)
+                if re.match(r"^(?:\d+(?:\.\d+)*)?\s*[A-Z][A-Za-z &/-]{2,60}$", qtxt):
+                    break
                 delete_paragraph(q)
 
-    # 6. Redact explicit email/ORCID/phone/URLs in remaining runs while
-    #    retaining paragraph/run formatting.
+    # 6. Redact identifiable runs (emails, links, ORCIDs)
     for p in list(iter_all_paragraphs(doc)):
         for run in p.runs:
             run.text = redact_run_text(run.text)
@@ -926,17 +889,11 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 
 
 def blind_copy_pdf_as_docx(pdf_bytes: bytes) -> bytes:
-    """PDF -> DOCX fallback.
-
-    A true layout-preserving PDF redaction requires PDF redaction tooling.
-    This fallback produces a clean reviewer-copy DOCX without adding editorial
-    text, but cannot guarantee identical PDF pagination.
-    """
+    """PDF text fallback for blind reviewer copy."""
     text = ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-    # Use the same conservative text rules for a PDF fallback.
     lines = text.splitlines()
     output_lines = []
     abstract_seen = False
@@ -955,13 +912,11 @@ def blind_copy_pdf_as_docx(pdf_bytes: bytes) -> bytes:
                 abstract_seen = True
                 output_lines.append(stripped)
                 continue
-            # Remove front matter before abstract.
             continue
 
         if paragraph_is_identifying(stripped):
             continue
-
-        if low in {"funding", "acknowledgments", "acknowledgements"}:
+        if low in REMOVABLE_SECTIONS:
             continue
 
         output_lines.append(redact_run_text(line))
@@ -977,25 +932,8 @@ def blind_copy_pdf_as_docx(pdf_bytes: bytes) -> bytes:
 
 
 # ============================================================
-# REPORT GENERATION
+# REPORT GENERATION (.DOCX)
 # ============================================================
-
-def add_status_table(doc: Document, checks: List[Dict[str, Any]]) -> None:
-    table = doc.add_table(rows=1, cols=4)
-    table.style = "Table Grid"
-    hdr = table.rows[0].cells
-    hdr[0].text = "MRJ Requirement"
-    hdr[1].text = "Status"
-    hdr[2].text = "Evidence"
-    hdr[3].text = "Action"
-
-    for check in checks:
-        cells = table.add_row().cells
-        cells[0].text = check["requirement"]
-        cells[1].text = check["status"]
-        cells[2].text = check["evidence"]
-        cells[3].text = check["action"]
-
 
 def generate_report_docx(
     filename: str,
@@ -1004,89 +942,82 @@ def generate_report_docx(
     reviewers: Dict[str, List[Dict[str, Any]]],
 ) -> bytes:
     doc = Document()
-
     doc.add_heading("MRJ Editorial Pre-Screening Report", 0)
-    doc.add_paragraph(
-        "This report is an editorial pre-screening aid. It does not replace human editorial judgment or peer review."
-    )
+    doc.add_paragraph("Editorial decision-support audit. Peer review and editor verification remain required.")
 
+    # Section 1: Template Compliance
     doc.add_heading("1. MRJ Template Compliance", level=1)
-    add_status_table(doc, checks)
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = "Requirement", "Status", "Evidence", "Action"
 
+    for check in checks:
+        cells = table.add_row().cells
+        cells[0].text = check["requirement"]
+        cells[1].text = check["status"]
+        cells[2].text = check["evidence"]
+        cells[3].text = check["action"]
+
+    # Section 2: AI Scientific Review
     doc.add_heading("2. AI-Assisted Manuscript Assessment", level=1)
+    doc.add_paragraph(f"Summary: {ai_data.get('summary', 'Not available.')}")
+    doc.add_paragraph(f"Research Area: {ai_data.get('research_area', 'Not assessed')}")
 
-    doc.add_heading("Assessment overview", level=2)
-    doc.add_paragraph(ai_data.get("summary", "Not available."))
-    doc.add_heading("Research area and reviewer-search keywords", level=2)
-    doc.add_paragraph(f"Research area: {ai_data.get('research_area', 'Not assessed')}")
-    doc.add_paragraph("Keywords: " + (", ".join(ai_data.get("keywords", [])) or "Not assessed"))
-    groups=[("Research question / objective","research_question"),("Abstract","abstract"),("Introduction and novelty","introduction_novelty"),("Methodology","methodology"),("Statistics / data analysis","statistics"),("Ethics and reproducibility","ethics_reproducibility"),("Results","results"),("Discussion","discussion"),("Conclusion","conclusion"),("Abstract–conclusion alignment","abstract_conclusion_alignment"),("Reference use","reference_use")]
-    doc.add_heading("Scientific pre-screening assessment", level=2)
-    for label,key in groups:
-        doc.add_heading(label, level=3); doc.add_paragraph(_format_ai_item(ai_data.get(key, {})))
-    doc.add_heading("Potential major red flags", level=2)
-    concerns=ai_data.get("major_red_flags", [])
+    groups = [
+        ("Research question / objective", "research_question"),
+        ("Abstract quality", "abstract"),
+        ("Introduction and novelty", "introduction_novelty"),
+        ("Methodology completeness", "methodology"),
+        ("Statistics / data analysis", "statistics"),
+        ("Ethics and reproducibility", "ethics_reproducibility"),
+        ("Results", "results"),
+        ("Discussion", "discussion"),
+        ("Conclusion", "conclusion"),
+        ("Abstract–conclusion alignment", "abstract_conclusion_alignment"),
+        ("Reference use", "reference_use"),
+    ]
+
+    for label, key in groups:
+        doc.add_heading(label, level=2)
+        doc.add_paragraph(_format_ai_item(ai_data.get(key, {})))
+
+    doc.add_heading("Major Red Flags", level=2)
+    concerns = ai_data.get("major_red_flags", [])
     if concerns:
-        for concern in concerns: doc.add_paragraph(concern, style="List Bullet")
-    else: doc.add_paragraph("No major red flags were identified from the supplied evidence.")
-    doc.add_heading("Editorial recommendation", level=2)
+        for c in concerns:
+            doc.add_paragraph(c, style="List Bullet")
+    else:
+        doc.add_paragraph("No major red flags detected from supplied evidence.")
+
+    doc.add_heading("Pre-Screening Editorial Recommendation", level=2)
     doc.add_paragraph(ai_data.get("editorial_recommendation", "Not assessed"))
-    doc.add_paragraph("This is a pre-screening aid only. Final editorial and peer-review decisions remain human responsibilities.")
 
-    doc.add_heading("3. Research Keywords Used for Reviewer Search", level=1)
-    keywords = ai_data.get("keywords", [])
-    doc.add_paragraph(", ".join(keywords) if keywords else "No keywords returned.")
-
-    doc.add_heading("4. Reviewer Candidates — Verification Required", level=1)
-    doc.add_paragraph(
-        "Names below are retrieved from OpenAlex publication records; they are not generated by the language model. "
-        "The listed institution is publication-associated or OpenAlex last-known affiliation and must be independently "
-        "checked by the editor before invitation. A candidate is not automatically suitable and COI screening remains human responsibility."
-    )
-
+    # Section 3: Reviewers
+    doc.add_heading("3. Reviewer Candidates (OpenAlex Live Verified)", level=1)
     for region in ["India", "Northeast India", "Assam"]:
         doc.add_heading(region, level=2)
         candidates = reviewers.get(region, [])
 
         if not candidates:
-            doc.add_paragraph("No candidate found from the available OpenAlex results.")
+            doc.add_paragraph("No candidate found from current OpenAlex query.")
             continue
-
         if "error" in candidates[0]:
             doc.add_paragraph(candidates[0]["error"])
             continue
 
-        table = doc.add_table(rows=1, cols=5)
-        table.style = "Table Grid"
-        headers = ["Name", "Institution", "Location", "Evidence", "Verification"]
-        for cell, header in zip(table.rows[0].cells, headers):
-            cell.text = header
+        tbl = doc.add_table(rows=1, cols=4)
+        tbl.style = "Table Grid"
+        h = tbl.rows[0].cells
+        h[0].text, h[1].text, h[2].text, h[3].text = "Name", "Affiliation", "Recent Publications", "Verification"
 
         for c in candidates:
-            cells = table.add_row().cells
-            cells[0].text = c["name"]
-            cells[1].text = c.get("last_known_institution") or c.get("institution", "")
-            cells[2].text = ", ".join(
-                x for x in [
-                    c.get("last_known_city", ""),
-                    c.get("last_known_region", ""),
-                    c.get("last_known_country", ""),
-                ] if x
-            )
-
-            pubs = sorted(
-                c.get("recent_publications", []),
-                key=lambda x: x.get("year", 0),
-                reverse=True,
-            )[:3]
-
-            evidence = []
-            for p in pubs:
-                doi = f" | {p['doi']}" if p.get("doi") else ""
-                evidence.append(f"{p.get('year', '')}: {p.get('title', '')}{doi}")
-
-            cells[3].text = "\n".join(evidence)
-            cells[4].text = c.get("verification_note", "")
+            row = tbl.add_row().cells
+            row[0].text = c["name"]
+            row[1].text = f"{c.get('last_known_institution', '')} ({c.get('last_known_city', '')}, {c.get('last_known_country', '')})"
+            pubs = c.get("recent_publications", [])[:2]
+            row[2].text = "\n".join(f"- {p.get('year', '')}: {p.get('title', '')}" for p in pubs)
+            row[3].text = c.get("verification_note", "")
 
     out = io.BytesIO()
     doc.save(out)
@@ -1103,200 +1034,178 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("MRJ AI Editorial Pre-Screening")
-st.caption(
-    "MRJ-template-based compliance checking, Groq structured analysis, "
-    "OpenAlex reviewer discovery, and blind-review document preparation."
-)
-
-with st.expander("Important workflow rules", expanded=False):
-    st.markdown(
-        """
-- Reviewer names are **not generated by the AI**.
-- MRJ formatting/compliance checks are deterministic wherever possible.
-- Groq is used for interpretive editorial assessment and research-keyword extraction.
-- The blind-review copy does **not** use AI rewriting.
-- The editor must verify reviewer identity, current affiliation, expertise, availability and conflicts of interest before invitation.
-        """
+# Sidebar Configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    groq_key = st.text_input(
+        "Groq API Key",
+        value=get_secret("GROQ_API_KEY"),
+        type="password",
+        help="Enter your Groq API key (starts with gsk_)"
     )
+    openalex_mailto = st.text_input(
+        "OpenAlex Mailto Email",
+        value=get_secret("OPENALEX_MAILTO", "editor@example.com"),
+        help="Email sent in User-Agent for OpenAlex courteous pool"
+    )
+    selected_model = st.selectbox(
+        "Groq Model",
+        options=[DEFAULT_GROQ_MODEL, "llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        index=0
+    )
+    st.markdown("---")
+    st.markdown("**MRJ Pre-Screening Engine v2.1**\n- Deterministic rule checks\n- Parallel structured LLM audit\n- Live OpenAlex discovery")
 
-uploaded_file = st.file_uploader(
-    "Upload manuscript",
-    type=["docx", "pdf"],
-    help="DOCX is recommended when you need the closest possible formatting preservation for the blind copy.",
-)
+st.title("MRJ AI Editorial Pre-Screening")
+st.caption("Standardized compliance evaluation, concurrent Groq structured analysis, and automated double-blind copy generator.")
+
+uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["docx", "pdf"])
 
 if uploaded_file:
-    st.info(
-        "For the best formatting-preserving blind copy, upload the original DOCX. "
-        "A PDF can be analyzed, but PDF-to-DOCX reconstruction cannot guarantee identical pagination/layout."
-    )
+    if st.button("Run Pre-Screening Analysis", type="primary"):
+        if not groq_key:
+            st.error("Groq API Key is required. Please provide it in the sidebar or Streamlit secrets.")
+            st.stop()
 
-    groq_key = get_secret("GROQ_API_KEY")
-    openalex_mailto = get_secret("OPENALEX_MAILTO")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-    if not groq_key:
-        st.error("GROQ_API_KEY is missing. Add it to Streamlit Secrets or the environment.")
-        st.stop()
-
-    if st.button("Run MRJ Pre-Screening", type="primary"):
         try:
-            with st.spinner("Extracting manuscript..."):
-                raw_text = extract_text(uploaded_file)
+            status_text.text("Extracting manuscript text...")
+            raw_text = extract_text(uploaded_file)
+            progress_bar.progress(20)
 
             if not raw_text.strip():
-                st.error("No readable text was extracted from the uploaded file.")
+                st.error("No readable text found in manuscript.")
                 st.stop()
 
-            with st.spinner("Running deterministic MRJ checks..."):
-                deterministic_checks = run_mrj_rule_checks(raw_text)
+            status_text.text("Executing deterministic MRJ checks...")
+            deterministic_checks = run_mrj_rule_checks(raw_text)
+            progress_bar.progress(40)
 
-            with st.spinner("Running structured Groq editorial assessment..."):
-                client = Groq(api_key=groq_key)
-                ai_data = run_ai_analysis(raw_text, deterministic_checks, client)
+            status_text.text("Running parallel Groq scientific analysis...")
+            client = Groq(api_key=groq_key)
+            ai_data = run_ai_analysis(raw_text, deterministic_checks, client, model=selected_model)
+            progress_bar.progress(65)
 
-            with st.spinner("Searching OpenAlex for real reviewer candidates..."):
-                reviewers = reviewer_search_report(ai_data, openalex_mailto)
+            status_text.text("Searching OpenAlex for candidates...")
+            reviewers = reviewer_search_report(ai_data, openalex_mailto)
+            progress_bar.progress(80)
 
-            with st.spinner("Creating blind-review copy..."):
-                original_bytes = uploaded_file.getvalue()
-                if uploaded_file.name.lower().endswith(".docx"):
-                    blind_bytes = blind_copy_docx(original_bytes)
-                    blind_filename = "MRJ_Blind_Reviewer_Copy.docx"
-                else:
-                    blind_bytes = blind_copy_pdf_as_docx(original_bytes)
-                    blind_filename = "MRJ_Blind_Reviewer_Copy.docx"
+            status_text.text("Generating blind reviewer copy...")
+            orig_bytes = uploaded_file.getvalue()
+            if uploaded_file.name.lower().endswith(".docx"):
+                blind_bytes = blind_copy_docx(orig_bytes)
+            else:
+                blind_bytes = blind_copy_pdf_as_docx(orig_bytes)
+            progress_bar.progress(90)
 
-            with st.spinner("Building editorial report..."):
-                report_bytes = generate_report_docx(
-                    uploaded_file.name,
-                    deterministic_checks,
-                    ai_data,
-                    reviewers,
-                )
+            status_text.text("Compiling editorial DOCX report...")
+            report_bytes = generate_report_docx(
+                uploaded_file.name,
+                deterministic_checks,
+                ai_data,
+                reviewers
+            )
+            progress_bar.progress(100)
+            status_text.empty()
 
+            # Store in session state
             st.session_state["mrj_checks"] = deterministic_checks
             st.session_state["mrj_ai"] = ai_data
             st.session_state["mrj_reviewers"] = reviewers
             st.session_state["mrj_blind"] = blind_bytes
-            st.session_state["mrj_blind_filename"] = blind_filename
             st.session_state["mrj_report"] = report_bytes
-            st.session_state["mrj_raw_text"] = raw_text
+            st.success("Pre-screening completed successfully.")
 
-            st.success("Pre-screening completed.")
-
-        except requests.HTTPError as exc:
-            st.error(f"OpenAlex/API error: {exc}")
         except Exception as exc:
             st.exception(exc)
 
+# Display Results if available
 if "mrj_checks" in st.session_state:
     checks = st.session_state["mrj_checks"]
     ai_data = st.session_state["mrj_ai"]
     reviewers = st.session_state["mrj_reviewers"]
 
-    st.subheader("1. MRJ Compliance")
-    status_counts = {
-        "PASS": sum(x["status"] == "PASS" for x in checks),
-        "WARN": sum(x["status"] == "WARN" for x in checks),
-        "FAIL": sum(x["status"] == "FAIL" for x in checks),
-    }
-
+    st.subheader("1. MRJ Formatting & Rule Compliance")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Pass", status_counts["PASS"])
-    c2.metric("Warnings", status_counts["WARN"])
-    c3.metric("Failures", status_counts["FAIL"])
+    c1.metric("Pass", sum(x["status"] == "PASS" for x in checks))
+    c2.metric("Warnings", sum(x["status"] == "WARN" for x in checks))
+    c3.metric("Fails", sum(x["status"] == "FAIL" for x in checks))
 
     st.dataframe(
-        [
-            {
-                "Requirement": x["requirement"],
-                "Status": x["status"],
-                "Evidence": x["evidence"],
-                "Action": x["action"],
-            }
-            for x in checks
-        ],
+        [{"Requirement": x["requirement"], "Status": x["status"], "Evidence": x["evidence"], "Action": x["action"]} for x in checks],
         use_container_width=True,
         hide_index=True,
     )
 
-    st.subheader("2. AI Scientific Pre-Screening")
-    st.write(ai_data.get("summary", ""))
-    st.write("**Research area:**", ai_data.get("research_area", ""))
-    st.write("**Reviewer-search keywords:**", ", ".join(ai_data.get("keywords", [])) or "Not assessed")
-    groups=[("Research question / objective","research_question"),("Abstract","abstract"),("Introduction and novelty","introduction_novelty"),("Methodology","methodology"),("Statistics / data analysis","statistics"),("Ethics and reproducibility","ethics_reproducibility"),("Results","results"),("Discussion","discussion"),("Conclusion","conclusion"),("Abstract–conclusion alignment","abstract_conclusion_alignment"),("Reference use","reference_use")]
-    for label,key in groups:
-        item=ai_data.get(key,{})
-        with st.expander(f"{label} — {item.get('status','NOT ASSESSABLE')}"):
-            st.write("**Finding:**", item.get("finding", "")); st.write("**Evidence:**", item.get("evidence", "") or "Not supplied."); st.write("**Action:**", item.get("action", "") or "Manual review required.")
-    concerns=ai_data.get("major_red_flags", [])
-    if concerns:
-        st.warning("Potential major red flags")
-        for item in concerns: st.write(f"- {item}")
-    st.write("**Editorial pre-screening recommendation:**", ai_data.get("editorial_recommendation", "Not assessed"))
+    st.subheader("2. AI Scientific Pre-Screening Assessment")
+    st.info(f"**Overview:** {ai_data.get('summary', '')}")
+    st.write(f"**Research Area:** {ai_data.get('research_area', '')}")
+    st.write(f"**Keywords Extracted:** {', '.join(ai_data.get('keywords', []))}")
 
-    st.subheader("3. Reviewer Candidates")
-    st.caption(
-        "These are retrieved from OpenAlex publication records. They are not hallucinated by the LLM. "
-        "Verify current affiliation, expertise and conflicts of interest before contacting anyone."
-    )
+    groups = [
+        ("Research question / objective", "research_question"),
+        ("Abstract", "abstract"),
+        ("Introduction & Novelty", "introduction_novelty"),
+        ("Methodology", "methodology"),
+        ("Statistics", "statistics"),
+        ("Ethics & Reproducibility", "ethics_reproducibility"),
+        ("Results", "results"),
+        ("Discussion", "discussion"),
+        ("Conclusions", "conclusion"),
+        ("Alignment", "abstract_conclusion_alignment"),
+        ("References", "reference_use"),
+    ]
 
+    for label, key in groups:
+        item = ai_data.get(key, {})
+        with st.expander(f"{label} — {item.get('status', 'NOT ASSESSABLE')}"):
+            st.write(f"**Finding:** {item.get('finding', '')}")
+            st.write(f"**Evidence:** {item.get('evidence', '') or 'None supplied'}")
+            st.write(f"**Action:** {item.get('action', '') or 'Manual check'}")
+
+    red_flags = ai_data.get("major_red_flags", [])
+    if red_flags:
+        st.warning("⚠️ Flagged Major Concerns:")
+        for rf in red_flags:
+            st.write(f"- {rf}")
+
+    st.write(f"**Recommendation:** `{ai_data.get('editorial_recommendation', 'Not assessed')}`")
+
+    st.subheader("3. Reviewer Candidates (Live OpenAlex)")
     for region, candidates in reviewers.items():
-        st.markdown(f"### {region}")
-
-        if not candidates:
-            st.write("No candidates found.")
-            continue
-
-        if "error" in candidates[0]:
-            st.error(candidates[0]["error"])
+        st.markdown(f"#### {region}")
+        if not candidates or "error" in candidates[0]:
+            st.write("No candidates found or query error.")
             continue
 
         rows = []
         for c in candidates:
-            pubs = sorted(
-                c.get("recent_publications", []),
-                key=lambda p: p.get("year", 0),
-                reverse=True,
-            )[:3]
+            pubs = c.get("recent_publications", [])[:2]
+            pub_text = " | ".join(f"{p.get('year', '')}: {p.get('title', '')[:45]}..." for p in pubs)
             rows.append({
                 "Name": c["name"],
                 "Institution": c.get("last_known_institution") or c.get("institution", ""),
-                "Location": ", ".join(
-                    x for x in [
-                        c.get("last_known_city", ""),
-                        c.get("last_known_region", ""),
-                        c.get("last_known_country", ""),
-                    ] if x
-                ),
-                "Recent publication evidence": "\n".join(
-                    f"{p.get('year', '')}: {p.get('title', '')}" for p in pubs
-                ),
-                "Verification": c.get("verification_note", ""),
+                "Location": f"{c.get('last_known_city', '')}, {c.get('last_known_country', '')}",
+                "Recent Works": pub_text,
+                "Match Note": c.get("verification_note", "")
             })
-
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
     st.subheader("4. Downloads")
-
-    st.download_button(
-        "Download MRJ Editorial Report (.docx)",
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "📥 Download Editorial Report (.docx)",
         data=st.session_state["mrj_report"],
-        file_name="MRJ_Editorial_PreScreening_Report.docx",
+        file_name="MRJ_PreScreening_Report.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True
     )
-
-    st.download_button(
-        "Download Blind Reviewer Copy (.docx)",
+    d2.download_button(
+        "📥 Download Blind Reviewer Copy (.docx)",
         data=st.session_state["mrj_blind"],
-        file_name=st.session_state["mrj_blind_filename"],
+        file_name="MRJ_Blind_Review_Copy.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True
     )
-
-    with st.expander("Technical note about blind-copy formatting"):
-        st.write(
-            "DOCX input is edited in-place at the document level: author/front-matter blocks and "
-            "identifying sections are removed, while existing runs and document formatting are retained "
-            "where possible. The application does not ask the LLM to rewrite the manuscript."
-        )
