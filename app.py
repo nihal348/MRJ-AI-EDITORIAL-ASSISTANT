@@ -403,150 +403,111 @@ def run_mrj_rule_checks(text: str) -> List[Dict[str, Any]]:
 # GROQ STRUCTURED ANALYSIS
 # ============================================================
 
-AI_SCHEMA = {
-    "name": "mrj_editorial_assessment",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string"},
-            "research_area": {"type": "string"},
-            "keywords": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "methodology_assessment": {"type": "string"},
-            "results_discussion_assessment": {"type": "string"},
-            "abstract_alignment": {"type": "string"},
-            "potential_major_concerns": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "editorial_recommendation": {
-                "type": "string",
-                "enum": ["Proceed to editorial review", "Needs author correction", "Major concern"],
-            },
-        },
-        "required": [
-            "summary",
-            "research_area",
-            "keywords",
-            "methodology_assessment",
-            "results_discussion_assessment",
-            "abstract_alignment",
-            "potential_major_concerns",
-            "editorial_recommendation",
-        ],
-        "additionalProperties": False,
-    },
-}
+STATUS_VALUES = ["PASS", "CONCERN", "MAJOR CONCERN", "NOT ASSESSABLE"]
 
 
-def run_ai_analysis(
-    text: str,
-    deterministic_checks: List[Dict[str, Any]],
-    client: Groq,
-) -> Dict[str, Any]:
-    """
-    Run the qualitative MRJ assessment with a deliberately small prompt.
+def assessment_schema(name: str, properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
+    return {"name": name, "strict": True, "schema": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}}
 
-    Groq's on-demand tier can impose a tokens-per-minute limit. The previous
-    implementation sent the same manuscript information several times
-    (section extracts + a 30,000-character full excerpt), which unnecessarily
-    inflated the request. This version sends only the information needed for
-    the qualitative assessment.
-    """
-    abstract = extract_abstract(text)
-    methods = extract_section_text(text, "materials and methods")
-    results = extract_section_text(text, "results and discussion")
-    conclusions = extract_section_text(text, "conclusions")
 
-    # Deterministic checks are already performed in Python. Give the model only
-    # their compact status/evidence summary; do not resend the manuscript.
-    rule_summary = "\n".join(
-        f"- {c['requirement']}: {c['status']} — {c['evidence']}"
-        for c in deterministic_checks
-    )[:7000]
+ITEM_SCHEMA = {"type": "object", "properties": {
+    "status": {"type": "string", "enum": STATUS_VALUES}, "finding": {"type": "string"},
+    "evidence": {"type": "string"}, "action": {"type": "string"}},
+    "required": ["status", "finding", "evidence", "action"], "additionalProperties": False}
 
-    # Hard character caps keep the request comfortably below the 8,000 TPM
-    # limit on the user's current Groq on-demand tier.
-    prompt = f"""
-You are a cautious academic journal editorial pre-screening assistant for MRJ.
+AI_CALL_1_SCHEMA = assessment_schema("mrj_scope_abstract_introduction", {
+    "research_area": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}},
+    "research_question": ITEM_SCHEMA, "abstract": ITEM_SCHEMA, "introduction_novelty": ITEM_SCHEMA},
+    ["research_area", "keywords", "research_question", "abstract", "introduction_novelty"])
+AI_CALL_2_SCHEMA = assessment_schema("mrj_methodology_statistics_ethics", {
+    "methodology": ITEM_SCHEMA, "statistics": ITEM_SCHEMA, "ethics_reproducibility": ITEM_SCHEMA},
+    ["methodology", "statistics", "ethics_reproducibility"])
+AI_CALL_3_SCHEMA = assessment_schema("mrj_results_discussion_conclusion", {
+    "results": ITEM_SCHEMA, "discussion": ITEM_SCHEMA, "conclusion": ITEM_SCHEMA,
+    "abstract_conclusion_alignment": ITEM_SCHEMA, "reference_use": ITEM_SCHEMA,
+    "major_red_flags": {"type": "array", "items": {"type": "string"}},
+    "editorial_recommendation": {"type": "string", "enum": ["Proceed to editorial review", "Needs author correction", "Major concern"]}},
+    ["results", "discussion", "conclusion", "abstract_conclusion_alignment", "reference_use", "major_red_flags", "editorial_recommendation"])
 
-Rules:
-- Assess only supplied evidence.
-- Never invent authors, reviewers, institutions, citations, results, or facts.
-- Do not rewrite the manuscript.
-- Deterministic checks below are authoritative for formatting/compliance.
-- If evidence is insufficient, say so.
-- Do not make an acceptance/rejection decision.
-- Return only the requested structured assessment.
 
-DETERMINISTIC MRJ CHECKS:
-{rule_summary}
+def _groq_json_call(client: Groq, schema: Dict[str, Any], prompt: str, max_tokens: int = 650) -> Dict[str, Any]:
+    response = client.chat.completions.create(model=GROQ_MODEL, messages=[
+        {"role": "system", "content": "You are a cautious academic journal pre-screening assistant. Assess only evidence supplied. Never invent facts, citations, authors, reviewers, institutions, sample sizes, results, statistical tests, ethics approvals, or research questions. If evidence is missing, use NOT ASSESSABLE. Do not rewrite manuscript text. Return only JSON."},
+        {"role": "user", "content": prompt}], temperature=0, reasoning_effort="medium", max_tokens=max_tokens,
+        response_format={"type": "json_schema", "json_schema": schema})
+    return json.loads(response.choices[0].message.content or "{}")
+
+
+def _ai_not_assessed(reason: str) -> Dict[str, Any]:
+    item = {"status": "NOT ASSESSABLE", "finding": reason, "evidence": "", "action": "Review this item manually."}
+    keys = ["research_question","abstract","introduction_novelty","methodology","statistics","ethics_reproducibility","results","discussion","conclusion","abstract_conclusion_alignment","reference_use"]
+    return {"summary": reason, "research_area": "Not assessed", "keywords": [], **{k: item.copy() for k in keys}, "major_red_flags": [reason], "editorial_recommendation": "Needs author correction"}
+
+
+def _compact_rule_summary(checks: List[Dict[str, Any]]) -> str:
+    return "\n".join(f"- {c['requirement']}: {c['status']} — {c['evidence']}" for c in checks)
+
+
+def run_ai_analysis(text: str, deterministic_checks: List[Dict[str, Any]], client: Groq) -> Dict[str, Any]:
+    """Run three focused AI assessments instead of one oversized manuscript prompt."""
+    abstract = extract_abstract(text); intro = extract_section_text(text, "introduction")
+    methods = extract_section_text(text, "materials and methods"); rd = extract_section_text(text, "results and discussion")
+    conclusion = extract_section_text(text, "conclusions"); refs = extract_section_text(text, "references")
+    rules = _compact_rule_summary(deterministic_checks)
+    try:
+        prompt1 = f"""MRJ PRE-SCREEN: RESEARCH QUESTION, ABSTRACT, INTRODUCTION
+
+MRJ CHECKS:
+{rules[:3500]}
 
 ABSTRACT:
-{abstract[:3500]}
+{abstract[:2600]}
+
+INTRODUCTION:
+{intro[:3800]}
+
+Assess: explicit research question/objective; abstract coverage of background, methods, results and conclusion; and whether the introduction establishes a supported gap/objective/novelty. Extract a concise research area and useful search keywords. Never infer missing facts. Use NOT ASSESSABLE when evidence is insufficient."""
+        a = _groq_json_call(client, AI_CALL_1_SCHEMA, prompt1, 600)
+        prompt2 = f"""MRJ PRE-SCREEN: METHODOLOGY, STATISTICS, ETHICS
+
+MRJ CHECKS:
+{rules[:3500]}
 
 MATERIALS AND METHODS:
-{methods[:6500]}
+{methods[:5000]}
+
+Assess methodology completeness/reproducibility; appropriateness and reporting of statistics/data analysis; and ethics/consent/animal/reproducibility information where relevant. Do not invent missing sample sizes, tests or approvals. Use NOT ASSESSABLE when evidence is insufficient."""
+        b = _groq_json_call(client, AI_CALL_2_SCHEMA, prompt2, 600)
+        prompt3 = f"""MRJ PRE-SCREEN: RESULTS, DISCUSSION, CONCLUSION, REFERENCES
+
+ABSTRACT:
+{abstract[:2200]}
 
 RESULTS AND DISCUSSION:
-{results[:7000]}
+{rd[:5200]}
 
 CONCLUSIONS:
-{conclusions[:3000]}
-"""
+{conclusion[:2200]}
 
-    try:
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a cautious journal-editor assistant. "
-                        "Return only the requested structured assessment."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            reasoning_effort="medium",
-            max_tokens=900,
-            response_format={
-                "type": "json_schema",
-                "json_schema": AI_SCHEMA,
-            },
-        )
+REFERENCES:
+{refs[:2400]}
 
-        content = response.choices[0].message.content or ""
-        return json.loads(content)
-
+Assess whether results answer the objective; discussion interprets rather than merely repeats; conclusion is supported and appropriately limited; abstract/conclusion are aligned; and citations/references are used coherently. Do not verify reference facts from memory. List only evidence-supported major red flags. Give a pre-screening recommendation, not an acceptance/rejection decision."""
+        c = _groq_json_call(client, AI_CALL_3_SCHEMA, prompt3, 680)
+        out = {}; out.update(a); out.update(b); out.update(c)
+        assess_keys = ["research_question","abstract","introduction_novelty","methodology","statistics","ethics_reproducibility","results","discussion","conclusion","abstract_conclusion_alignment","reference_use"]
+        concern_count = sum(out.get(k, {}).get("status") in ("CONCERN", "MAJOR CONCERN") for k in assess_keys)
+        out["summary"] = (f"Focused AI assessment completed across 11 scientific areas; {concern_count} area(s) were flagged as CONCERN or MAJOR CONCERN. Objective MRJ compliance remains based on deterministic checks." if concern_count else "Focused AI assessment completed across 11 scientific areas. No CONCERN or MAJOR CONCERN item was flagged from the supplied evidence; this does not replace peer review.")
+        return out
     except Exception as exc:
-        # Keep the application usable when Groq throttles the request.
-        # The deterministic MRJ checks remain available and are not discarded.
-        error_text = str(exc)
-        if "413" in error_text or "tokens per minute" in error_text.lower():
-            return {
-                "summary": (
-                    "The deterministic MRJ checks were completed, but the "
-                    "qualitative Groq assessment was skipped because the "
-                    "current Groq tokens-per-minute limit was exceeded."
-                ),
-                "research_area": "Not assessed",
-                "keywords": [],
-                "methodology_assessment": "Not assessed because the AI request was rate-limited.",
-                "results_discussion_assessment": "Not assessed because the AI request was rate-limited.",
-                "abstract_alignment": "Not assessed because the AI request was rate-limited.",
-                "potential_major_concerns": [
-                    "Groq request exceeded the current tokens-per-minute limit. "
-                    "The manuscript was not modified."
-                ],
-                "editorial_recommendation": "Needs author correction",
-            }
+        msg = str(exc)
+        if "413" in msg or "tokens per minute" in msg.lower():
+            return _ai_not_assessed("Groq rate limit was reached. Deterministic MRJ checks remain valid and the manuscript was not modified.")
+        return _ai_not_assessed(f"Structured AI assessment failed: {msg}")
 
-        raise
+
+def _format_ai_item(item: Dict[str, Any]) -> str:
+    return "\n".join([f"Status: {item.get('status', 'NOT ASSESSABLE')}", f"Finding: {item.get('finding', '')}", f"Evidence: {item.get('evidence', '') or 'Not supplied.'}", f"Action: {item.get('action', '') or 'Manual review required.'}"])
 
 
 # ============================================================
@@ -1015,26 +976,23 @@ def generate_report_docx(
 
     doc.add_heading("2. AI-Assisted Manuscript Assessment", level=1)
 
-    fields = [
-        ("Summary", ai_data.get("summary", "")),
-        ("Research area", ai_data.get("research_area", "")),
-        ("Methodology assessment", ai_data.get("methodology_assessment", "")),
-        ("Results and discussion assessment", ai_data.get("results_discussion_assessment", "")),
-        ("Abstract alignment", ai_data.get("abstract_alignment", "")),
-        ("Editorial recommendation", ai_data.get("editorial_recommendation", "")),
-    ]
-
-    for label, value in fields:
-        doc.add_heading(label, level=2)
-        doc.add_paragraph(value or "Not available.")
-
-    concerns = ai_data.get("potential_major_concerns", [])
-    doc.add_heading("Potential major concerns", level=2)
+    doc.add_heading("Assessment overview", level=2)
+    doc.add_paragraph(ai_data.get("summary", "Not available."))
+    doc.add_heading("Research area and reviewer-search keywords", level=2)
+    doc.add_paragraph(f"Research area: {ai_data.get('research_area', 'Not assessed')}")
+    doc.add_paragraph("Keywords: " + (", ".join(ai_data.get("keywords", [])) or "Not assessed"))
+    groups=[("Research question / objective","research_question"),("Abstract","abstract"),("Introduction and novelty","introduction_novelty"),("Methodology","methodology"),("Statistics / data analysis","statistics"),("Ethics and reproducibility","ethics_reproducibility"),("Results","results"),("Discussion","discussion"),("Conclusion","conclusion"),("Abstract–conclusion alignment","abstract_conclusion_alignment"),("Reference use","reference_use")]
+    doc.add_heading("Scientific pre-screening assessment", level=2)
+    for label,key in groups:
+        doc.add_heading(label, level=3); doc.add_paragraph(_format_ai_item(ai_data.get(key, {})))
+    doc.add_heading("Potential major red flags", level=2)
+    concerns=ai_data.get("major_red_flags", [])
     if concerns:
-        for concern in concerns:
-            doc.add_paragraph(concern, style="List Bullet")
-    else:
-        doc.add_paragraph("No major concerns were identified by the AI assessment.")
+        for concern in concerns: doc.add_paragraph(concern, style="List Bullet")
+    else: doc.add_paragraph("No major red flags were identified from the supplied evidence.")
+    doc.add_heading("Editorial recommendation", level=2)
+    doc.add_paragraph(ai_data.get("editorial_recommendation", "Not assessed"))
+    doc.add_paragraph("This is a pre-screening aid only. Final editorial and peer-review decisions remain human responsibilities.")
 
     doc.add_heading("3. Research Keywords Used for Reviewer Search", level=1)
     keywords = ai_data.get("keywords", [])
@@ -1224,19 +1182,20 @@ if "mrj_checks" in st.session_state:
         hide_index=True,
     )
 
-    st.subheader("2. AI Editorial Assessment")
+    st.subheader("2. AI Scientific Pre-Screening")
     st.write(ai_data.get("summary", ""))
     st.write("**Research area:**", ai_data.get("research_area", ""))
-    st.write("**Methodology:**", ai_data.get("methodology_assessment", ""))
-    st.write("**Results & Discussion:**", ai_data.get("results_discussion_assessment", ""))
-    st.write("**Abstract alignment:**", ai_data.get("abstract_alignment", ""))
-    st.write("**Editorial recommendation:**", ai_data.get("editorial_recommendation", ""))
-
-    concerns = ai_data.get("potential_major_concerns", [])
+    st.write("**Reviewer-search keywords:**", ", ".join(ai_data.get("keywords", [])) or "Not assessed")
+    groups=[("Research question / objective","research_question"),("Abstract","abstract"),("Introduction and novelty","introduction_novelty"),("Methodology","methodology"),("Statistics / data analysis","statistics"),("Ethics and reproducibility","ethics_reproducibility"),("Results","results"),("Discussion","discussion"),("Conclusion","conclusion"),("Abstract–conclusion alignment","abstract_conclusion_alignment"),("Reference use","reference_use")]
+    for label,key in groups:
+        item=ai_data.get(key,{})
+        with st.expander(f"{label} — {item.get('status','NOT ASSESSABLE')}"):
+            st.write("**Finding:**", item.get("finding", "")); st.write("**Evidence:**", item.get("evidence", "") or "Not supplied."); st.write("**Action:**", item.get("action", "") or "Manual review required.")
+    concerns=ai_data.get("major_red_flags", [])
     if concerns:
-        st.warning("Potential concerns identified by AI")
-        for item in concerns:
-            st.write(f"- {item}")
+        st.warning("Potential major red flags")
+        for item in concerns: st.write(f"- {item}")
+    st.write("**Editorial pre-screening recommendation:**", ai_data.get("editorial_recommendation", "Not assessed"))
 
     st.subheader("3. Reviewer Candidates")
     st.caption(
