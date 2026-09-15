@@ -9,7 +9,7 @@ import requests
 import streamlit as st
 from docx import Document
 from docx.text.paragraph import Paragraph
-from groq import Groq, BadRequestError, RateLimitError
+from groq import Groq, BadRequestError
 
 
 # ============================================================
@@ -93,26 +93,27 @@ def word_count(text: str) -> int:
 
 
 def clean_json_response(raw_resp: str) -> Dict[str, Any]:
-    """Parse JSON text, stripping potential markdown fences and cleaning invalid control characters."""
+    """Strip markdown wrapping and parse strictly valid JSON."""
     clean = re.sub(r"^```(?:json)?\s*", "", raw_resp.strip(), flags=re.MULTILINE)
-    clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE)
-    clean = clean.strip()
+    clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE).strip()
     try:
         return json.loads(clean)
     except Exception:
-        # Match the outermost JSON object if surrounding commentary exists
         match = re.search(r"(\{.*\})", clean, re.DOTALL)
         if match:
             return json.loads(match.group(1))
-        raise ValueError("Could not parse valid JSON from AI completion.")
+        raise ValueError("Could not parse valid JSON from AI response.")
 
 
 # ============================================================
-# ASSET & SECTION EXTRACTION
+# ASSET & SECTION EXTRACTION (RULE 4: DEDUPLICATION & FORMAL CAPTIONS)
 # ============================================================
 
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
-    """Extract full manuscript text while auditing visual assets (images and tables)."""
+    """
+    Extract document text and deduplicate formal captions.
+    Ignores informal narrative mentions (e.g. 'as shown in Figure 1').
+    """
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
     asset_meta = {
@@ -121,6 +122,9 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
         "total_tables": 0,
         "detected_captions": [],
     }
+
+    seen_labels = set()
+    caption_regex = re.compile(r"^\s*((?:Figure|Fig\.?|Table)\s*\d+)[\s.:-]+([^\n]+)", re.IGNORECASE)
 
     if name.endswith(".docx"):
         doc = Document(io.BytesIO(data))
@@ -133,13 +137,18 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
             txt = p.text.strip()
             if txt:
                 parts.append(txt)
-                if re.match(r"(?i)^(figure|fig\.?|table)\s+\d+", txt):
-                    asset_meta["detected_captions"].append({
-                        "caption": txt,
-                        "location": "Inline Body",
-                        "has_image": asset_meta["total_images"] > 0,
-                        "has_table": asset_meta["total_tables"] > 0,
-                    })
+                m = caption_regex.match(txt)
+                if m:
+                    label = normalize(m.group(1)).title()
+                    if label not in seen_labels:
+                        seen_labels.add(label)
+                        asset_meta["detected_captions"].append({
+                            "label": label,
+                            "caption": txt,
+                            "placement": "In-line document body",
+                            "has_image": asset_meta["total_images"] > 0,
+                            "has_table": asset_meta["total_tables"] > 0,
+                        })
 
         for table in doc.tables:
             for row in table.rows:
@@ -161,13 +170,18 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 
                 for line in page_text.splitlines():
                     sline = line.strip()
-                    if re.match(r"(?i)^(figure|fig\.?|table)\s+\d+", sline):
-                        asset_meta["detected_captions"].append({
-                            "caption": sline,
-                            "location": f"Page {page_idx + 1}",
-                            "has_image": images_on_page > 0,
-                            "has_table": tables_on_page > 0,
-                        })
+                    m = caption_regex.match(sline)
+                    if m:
+                        label = normalize(m.group(1)).title()
+                        if label not in seen_labels:
+                            seen_labels.add(label)
+                            asset_meta["detected_captions"].append({
+                                "label": label,
+                                "caption": sline,
+                                "placement": "In-line document body",
+                                "has_image": images_on_page > 0,
+                                "has_table": tables_on_page > 0,
+                            })
 
         return "\n".join(pages), asset_meta
 
@@ -179,37 +193,38 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
-    "name": "manuscript_peer_review_audit",
+    "name": "manuscript_pre_screening_audit",
     "strict": True,
     "schema": {
         "type": "object",
         "properties": {
-            "manuscript_meta": {
+            "manuscript_title": {"type": "string"},
+            "editorial_verdict": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "keywords": {"type": "array", "items": {"type": "string"}},
-                    "editorial_verdict": {
+                    "decision": {
                         "type": "string",
                         "enum": ["Accept with Minor Revisions", "Major Revisions", "Reject"],
                     },
-                    "verdict_rationale": {"type": "string"},
+                    "summary_notes": {"type": "string"},
                 },
-                "required": ["title", "keywords", "editorial_verdict", "verdict_rationale"],
+                "required": ["decision", "summary_notes"],
                 "additionalProperties": False,
             },
-            "structural_template_audit": {
+            "structural_section_checks": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
                         "section_name": {"type": "string"},
-                        "detected": {"type": "boolean"},
-                        "heading_evidence": {"type": "string"},
-                        "status": {"type": "string", "enum": ["PASS", "WARN", "FAIL"]},
-                        "critique": {"type": "string"},
+                        "detected_heading": {"type": "string"},
+                        "first_line_quote": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["PASS", "WARN", "FAIL", "NOT EVALUATED (EXCERPT PROVIDED)"],
+                        },
                     },
-                    "required": ["section_name", "detected", "heading_evidence", "status", "critique"],
+                    "required": ["section_name", "detected_heading", "first_line_quote", "status"],
                     "additionalProperties": False,
                 },
             },
@@ -218,74 +233,41 @@ AUDIT_STRICT_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "asset_type": {"type": "string"},
                         "label": {"type": "string"},
-                        "caption": {"type": "string"},
                         "placement": {"type": "string"},
                         "visual_present": {"type": "boolean"},
-                        "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+                        "status": {
+                            "type": "string",
+                            "enum": ["PASS", "FAIL", "NOT EVALUATED (EXCERPT PROVIDED)"],
+                        },
                     },
-                    "required": ["asset_type", "label", "caption", "placement", "visual_present", "status"],
+                    "required": ["label", "placement", "visual_present", "status"],
                     "additionalProperties": False,
                 },
             },
-            "detailed_methodology_analysis": {
+            "methodology_and_math_logic": {
                 "type": "object",
                 "properties": {
                     "sample_size_check": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string", "enum": ["PASS", "WARN", "FAIL"]},
-                            "reported_n": {"type": "string"},
-                            "explanation": {"type": "string"},
-                        },
-                        "required": ["status", "reported_n", "explanation"],
-                        "additionalProperties": False,
+                        "type": "string",
+                        "enum": ["PASS", "WARN", "FAIL"],
                     },
-                    "software_and_reproducibility": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string", "enum": ["PASS", "WARN", "FAIL"]},
-                            "tools_identified": {"type": "string"},
-                            "missing_parameters": {"type": "string"},
-                        },
-                        "required": ["status", "tools_identified", "missing_parameters"],
-                        "additionalProperties": False,
+                    "missing_domain_metrics": {
+                        "type": "array",
+                        "items": {"type": "string"},
                     },
-                    "domain_specific_metrics": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string", "enum": ["PASS", "WARN", "FAIL"]},
-                            "h_index_present": {"type": "boolean"},
-                            "g_index_present": {"type": "boolean"},
-                            "m_index_present": {"type": "boolean"},
-                            "counting_method": {"type": "string"},
-                            "analysis_notes": {"type": "string"},
-                        },
-                        "required": ["status", "h_index_present", "g_index_present", "m_index_present", "counting_method", "analysis_notes"],
-                        "additionalProperties": False,
-                    },
+                    "software_reproducibility_notes": {"type": "string"},
                 },
-                "required": ["sample_size_check", "software_and_reproducibility", "domain_specific_metrics"],
-                "additionalProperties": False,
-            },
-            "facet_narrative_evaluations": {
-                "type": "object",
-                "properties": {
-                    "research_gap_novelty": {"type": "string"},
-                    "methodological_rigor": {"type": "string"},
-                    "data_discussion_alignment": {"type": "string"},
-                },
-                "required": ["research_gap_novelty", "methodological_rigor", "data_discussion_alignment"],
+                "required": ["sample_size_check", "missing_domain_metrics", "software_reproducibility_notes"],
                 "additionalProperties": False,
             },
         },
         "required": [
-            "manuscript_meta",
-            "structural_template_audit",
+            "manuscript_title",
+            "editorial_verdict",
+            "structural_section_checks",
             "visual_asset_audit",
-            "detailed_methodology_analysis",
-            "facet_narrative_evaluations",
+            "methodology_and_math_logic",
         ],
         "additionalProperties": False,
     },
@@ -293,93 +275,108 @@ AUDIT_STRICT_SCHEMA = {
 
 
 # ============================================================
-# RESILIENT GROQ AUDIT ENGINE (PREVENTS 400 BAD REQUEST)
+# AUDIT ENGINE (EXACT INSTRUCTIONS APPLIED)
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute the editorial audit with multiple fallback layers against HTTP 400 Bad Request."""
-    prompt = f"""You are a senior academic peer reviewer and editorial prescreening manager. Conduct a rigorous, line-by-line audit of this manuscript text.
+    """Execute evidence-based manuscript audit enforcing all 5 critical audit rules."""
+    total_words = word_count(raw_text)
+    has_references = bool(re.search(r"(?i)\b(?:references|bibliography)\b", raw_text))
+    is_likely_excerpt = (total_words < 2500) and not has_references
 
-ASSET METADATA (Cross-modal visual detection):
-- Total embedded image elements found: {asset_meta['total_images']}
-- Total data tables found: {asset_meta['total_tables']}
-- Captions detected: {json.dumps(asset_meta['detected_captions'])}
+    truncation_context = (
+        "DOCUMENT COMPLETION STATUS: FULL PAPER LIKELY."
+        if not is_likely_excerpt
+        else "DOCUMENT COMPLETION STATUS: FRAGMENT / EXCERPT DETECTED (Document length is brief and lacks References)."
+    )
 
---- SECTION 1: UNIVERSAL ACADEMIC TEMPLATE AUDIT ---
-Evaluate each required section:
+    prompt = f"""You are an expert academic manuscript pre-screener and editorial auditor. Conduct a thorough, evidence-based audit of the provided manuscript text.
+
+CRITICAL AUDIT CONSTRAINTS & RULES:
+
+1. EXCERPT & TRUNCATION HANDLING (STRICT):
+   - NEVER declare a section "FAIL" or "Not Found" if you are evaluating an incomplete excerpt or fragment of a document.
+   - If a standard section is absent due to text truncation or partial file upload, mark its status strictly as "NOT EVALUATED (EXCERPT PROVIDED)".
+   - Mark a section as "FAIL" ONLY if the manuscript is complete and the section is explicitly missing.
+   - For optional sections (e.g., Acknowledgments, Funding, Ethics Statement, AI Usage), mark as "WARN" rather than "FAIL" if omitted in full papers.
+
+2. MANUSCRIPT TITLE EXTRACTION:
+   - Extract the actual academic paper title (e.g., "Consumer Perception, Food Waste and Food Packaging Research...").
+   - NEVER output a DOI link, URL, header string, or journal name in the "manuscript_title" field.
+
+3. EVIDENCE-BASED SECTION VERIFICATION:
+   - For every detected section, extract the exact first-line quote from the document text to prove its presence.
+
+4. VISUAL ASSET AUDIT & DEDUPLICATION:
+   - Audit formal captions only (e.g., "Figure 1: ...", "Table 2: ...").
+   - Do NOT create separate entries for informal text mentions within narrative paragraphs (e.g., ignore sentences like "as shown in Figure 1").
+
+5. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
+   - For bibliometric/scientometric papers, explicitly check for missing standard metrics: h-index, g-index, m-index.
+   - Audit software reproducibility: check if version numbers, parameter settings, or normalization techniques (e.g., VOSviewer, Biblioshiny, CiteSpace) are explicitly reported.
+
+{truncation_context}
+
+DETECTED ASSET CAPTIONS IN EXTRACTION:
+{json.dumps(asset_meta['detected_captions'], indent=2)}
+
+SECTIONS TO EVALUATE:
 {json.dumps(REQUIRED_TEMPLATE_SECTIONS)}
-1. Title & Abstract: Check if Abstract exceeds 200–250 words and if structured. Extract 3–5 key keywords.
-2. Introduction: Check Research Problem, Background, and Research Gap/Novelty.
-3. Materials and Methods: Check software versions, parameter settings, algorithm choices, normalization methods, and search strings.
-4. Results and Discussion: Check if findings are backed by data.
-5. Conclusions: Summarize main findings, implications, and limitations.
-6. Declarations: Verify Funding, Conflicts of Interest, AI Usage, Acknowledgments, Ethics Approval.
 
---- SECTION 2: DETAILED METHODOLOGY & SCIENTIFIC AUDIT ---
-1. Data & Sample Size Accounting: Mathematical consistency between raw data, filtering steps, and final sample size (N).
-2. Bibliometric indicators: Check h-index, g-index, m-index, software versions (VOSviewer, Biblioshiny), normalization, and counting logic (Full vs Fractional).
-3. Non-Bibliometric studies: Sample size justification, statistical assumptions, power analysis, PRISMA flow.
-
---- SECTION 3: VISUAL ASSET & CAPTION INTEGRITY ---
-Audit all Figures and Tables. Confirm whether inline embedded assets exist for every caption found.
-
-MANUSCRIPT EXCERPTS:
+MANUSCRIPT TEXT:
 --- START OF TEXT ---
-{raw_text[:12000]}
+{raw_text[:14000]}
 --- END OF TEXT ---
 
-Return strictly a valid JSON object matching the requested schema."""
+Return strictly valid, unformatted JSON matching the schema."""
 
     messages = [
         {
             "role": "system",
-            "content": "You are a senior academic peer reviewer. Audit the manuscript thoroughly with zero hallucinations. Output strictly valid JSON.",
+            "content": "You are a senior academic peer reviewer and editorial auditor. Output strictly valid JSON matching the requested schema.",
         },
         {"role": "user", "content": prompt},
     ]
 
-    # ATTEMPT 1: Primary model with json_schema and explicit token budget
+    # Attempt 1: Strict JSON schema execution with primary model
     try:
         resp = client.chat.completions.create(
             model=PRIMARY_MODEL,
             messages=messages,
-            temperature=0.1,
+            temperature=0.0,
             reasoning_effort="low",
             include_reasoning=False,
             max_completion_tokens=4500,
             response_format={"type": "json_schema", "json_schema": AUDIT_STRICT_SCHEMA},
         )
-        content = resp.choices[0].message.content or "{}"
-        return clean_json_response(content)
-    except (BadRequestError, Exception) as e1:
-        st.warning(f"Note: Primary structured call adjusted due to provider constraints ({type(e1).__name__}). Switching to JSON mode fallback.")
+        return clean_json_response(resp.choices[0].message.content or "{}")
+    except (BadRequestError, Exception):
+        pass
 
-    # ATTEMPT 2: Primary model with json_object mode (universal JSON enforcement)
+    # Attempt 2: Primary model with json_object enforcement
     try:
         resp = client.chat.completions.create(
             model=PRIMARY_MODEL,
             messages=messages,
-            temperature=0.1,
+            temperature=0.0,
             reasoning_effort="low",
             include_reasoning=False,
             max_completion_tokens=4500,
             response_format={"type": "json_object"},
         )
-        content = resp.choices[0].message.content or "{}"
-        return clean_json_response(content)
-    except (BadRequestError, Exception) as e2:
-        st.warning(f"Note: Secondary fallback invoked on stable model {FALLBACK_MODEL}.")
+        return clean_json_response(resp.choices[0].message.content or "{}")
+    except (BadRequestError, Exception):
+        pass
 
-    # ATTEMPT 3: Fallback model (llama-3.3-70b-versatile) with json_object mode
+    # Attempt 3: High-reliability fallback model
     resp = client.chat.completions.create(
         model=FALLBACK_MODEL,
         messages=messages,
-        temperature=0.1,
+        temperature=0.0,
         max_completion_tokens=4000,
         response_format={"type": "json_object"},
     )
-    content = resp.choices[0].message.content or "{}"
-    return clean_json_response(content)
+    return clean_json_response(resp.choices[0].message.content or "{}")
 
 
 # ============================================================
@@ -412,8 +409,8 @@ def candidate_region_match(candidate: Dict[str, Any], region: str) -> bool:
     return False
 
 
-def search_openalex_reviewers(keywords: List[str], region: str, mailto: str = "", max_candidates: int = 5) -> List[Dict[str, Any]]:
-    query = " ".join(keywords[:5]).strip()
+def search_openalex_reviewers(query_terms: List[str], region: str, mailto: str = "", max_candidates: int = 5) -> List[Dict[str, Any]]:
+    query = " ".join(query_terms[:4]).strip()
     if not query:
         return []
 
@@ -459,11 +456,14 @@ def search_openalex_reviewers(keywords: List[str], region: str, mailto: str = ""
     return results[:max_candidates]
 
 
-def reviewer_discovery_report(keywords: List[str], mailto: str = "") -> Dict[str, List[Dict[str, Any]]]:
+def reviewer_discovery_report(title: str, mailto: str = "") -> Dict[str, List[Dict[str, Any]]]:
+    # Extract salient search terms from the identified manuscript title
+    stopwords = {"a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "of", "by", "from", "using", "study", "analysis"}
+    terms = [w for w in re.findall(r"\b[A-Za-z]{3,}\b", title) if w.lower() not in stopwords]
     output = {}
     for r in ["India", "Northeast India", "Assam"]:
         try:
-            output[r] = search_openalex_reviewers(keywords, r, mailto=mailto)
+            output[r] = search_openalex_reviewers(terms, r, mailto=mailto)
         except Exception as exc:
             output[r] = [{"error": f"OpenAlex query failed: {exc}"}]
     return output
@@ -515,43 +515,45 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 
 def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[str, Any]]]) -> bytes:
     doc = Document()
-    meta = audit.get("manuscript_meta", {})
-    doc.add_heading("Academic Editorial Pre-Screening Audit Report", 0)
-    doc.add_paragraph(f"Manuscript Title: {meta.get('title', 'Not specified')}")
-    doc.add_paragraph(f"Editorial Verdict: {meta.get('editorial_verdict', 'Under Review')}")
-    doc.add_paragraph(f"Verdict Rationale: {meta.get('verdict_rationale', '')}")
+    doc.add_heading("Manuscript Pre-Screening & Editorial Audit Report", 0)
+    doc.add_paragraph(f"Manuscript Title: {audit.get('manuscript_title', 'Not specified')}")
+    
+    verd = audit.get("editorial_verdict", {})
+    doc.add_paragraph(f"Verdict: {verd.get('decision', 'Under Review')}")
+    doc.add_paragraph(f"Summary Notes: {verd.get('summary_notes', '')}")
 
-    doc.add_heading("1. Universal Academic Template Audit", level=1)
+    doc.add_heading("1. Structural Section Verification", level=1)
     tbl = doc.add_table(rows=1, cols=4)
     tbl.style = "Table Grid"
     h = tbl.rows[0].cells
-    h[0].text, h[1].text, h[2].text, h[3].text = "Section", "Detected", "Status", "Critique"
-    for item in audit.get("structural_template_audit", []):
+    h[0].text, h[1].text, h[2].text, h[3].text = "Section", "Detected Heading", "First-Line Quote", "Status"
+    for s in audit.get("structural_section_checks", []):
         row = tbl.add_row().cells
-        row[0].text = item.get("section_name", "")
-        row[1].text = "Yes" if item.get("detected") else "No"
-        row[2].text = item.get("status", "")
-        row[3].text = item.get("critique", "")
+        row[0].text = s.get("section_name", "")
+        row[1].text = s.get("detected_heading", "")
+        row[2].text = s.get("first_line_quote", "")
+        row[3].text = s.get("status", "")
 
-    doc.add_heading("2. Detailed Methodology & Scientific Audit", level=1)
-    d_meth = audit.get("detailed_methodology_analysis", {})
-    s_check = d_meth.get("sample_size_check", {})
-    doc.add_paragraph(f"Sample Size Accounting: [{s_check.get('status', 'N/A')}] Reported N = {s_check.get('reported_n', 'N/A')}")
-    doc.add_paragraph(f"Filtering Logic: {s_check.get('explanation', '')}")
-
-    s_rep = d_meth.get("software_and_reproducibility", {})
-    doc.add_paragraph(f"Software Tools: {s_rep.get('tools_identified', 'None')}")
-    doc.add_paragraph(f"Missing Parameters: {s_rep.get('missing_parameters', 'None')}")
-
-    d_metr = d_meth.get("domain_specific_metrics", {})
-    doc.add_paragraph(f"Counting Method: {d_metr.get('counting_method', 'Unspecified')}")
-    doc.add_paragraph(f"Domain Metrics Notes: {d_metr.get('analysis_notes', '')}")
-
-    doc.add_heading("3. Visual Asset & Caption Integrity", level=1)
+    doc.add_heading("2. Visual Asset Audit", level=1)
+    v_tbl = doc.add_table(rows=1, cols=4)
+    v_tbl.style = "Table Grid"
+    vh = v_tbl.rows[0].cells
+    vh[0].text, vh[1].text, vh[2].text, vh[3].text = "Label", "Placement", "Visual Present", "Status"
     for v in audit.get("visual_asset_audit", []):
-        doc.add_paragraph(f"• {v.get('asset_type')} {v.get('label')} [{v.get('status')}]: {v.get('caption')} (Placement: {v.get('placement')}, Graphic Present: {v.get('visual_present')})")
+        row = v_tbl.add_row().cells
+        row[0].text = v.get("label", "")
+        row[1].text = v.get("placement", "")
+        row[2].text = "Yes" if v.get("visual_present") else "No"
+        row[3].text = v.get("status", "")
 
-    doc.add_heading("4. Reviewer Candidates (OpenAlex)", level=1)
+    doc.add_heading("3. Methodology & Math Logic", level=1)
+    meth = audit.get("methodology_and_math_logic", {})
+    doc.add_paragraph(f"Sample Size Accounting: {meth.get('sample_size_check', 'N/A')}")
+    missing_metrics = ", ".join(meth.get("missing_domain_metrics", [])) or "None identified"
+    doc.add_paragraph(f"Missing Domain Metrics: {missing_metrics}")
+    doc.add_paragraph(f"Software Reproducibility Notes: {meth.get('software_reproducibility_notes', '')}")
+
+    doc.add_heading("4. Potential Reviewer Candidates (OpenAlex)", level=1)
     for reg, cands in reviewers.items():
         doc.add_heading(reg, level=2)
         for c in cands:
@@ -564,46 +566,48 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
 
 
 # ============================================================
-# STREAMLIT UI (STRUCTURED DASHBOARD - NO RAW JSON)
+# STREAMLIT UI (CLEAN EDITORIAL DASHBOARD, NO RAW JSON)
 # ============================================================
 
-st.set_page_config(page_title="Academic Manuscript Audit", page_icon="🎓", layout="wide")
-st.title("🎓 Academic Editorial Pre-Screening & Scientific Audit")
-st.caption("Universal template compliance, methodological logic & sample size validation, and visual asset integrity.")
+st.set_page_config(page_title="Academic Manuscript Audit", page_icon="📑", layout="wide")
+st.title("📑 Academic Manuscript Pre-Screening & Editorial Auditor")
+st.caption("Evidence-based structural checks, caption deduplication, and scientometric reproducibility analysis.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     groq_api_key = st.text_input("Groq API Key", value=get_secret("GROQ_API_KEY"), type="password")
     openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editor@academicprescreen.org"))
     st.markdown("---")
-    st.markdown("**Strict Scientific Checkpoints:**")
-    st.markdown("1. **Structural Audit**: Abstract 200–250w, IMRaD, Declarations & Governance.")
-    st.markdown("2. **Methodology Audit**: Sample accounting ($N$), h/g/m indices, counting logic.")
-    st.markdown("3. **Visual Integrity**: Inline graphic verification for every caption.")
+    st.markdown("**Critical Pre-Screening Directives:**")
+    st.markdown("1. **Truncation Handling**: Missing sections in excerpts marked as `NOT EVALUATED (EXCERPT PROVIDED)`.")
+    st.markdown("2. **Title Extraction**: Real paper title extracted; no DOIs/URLs.")
+    st.markdown("3. **Evidence-Based Quotes**: Verifies first-line quotes for detected headings.")
+    st.markdown("4. **Asset Deduplication**: Audits formal captions only.")
+    st.markdown("5. **Scientometrics**: Checks h/g/m indices & software parameters.")
 
 uploaded_file = st.file_uploader("Upload Manuscript (.pdf or .docx)", type=["pdf", "docx"])
 
-if uploaded_file and st.button("🚀 Conduct Line-by-Line Academic Audit", type="primary"):
+if uploaded_file and st.button("🚀 Conduct Evidence-Based Audit", type="primary"):
     if not groq_api_key:
         st.error("Please provide a valid Groq API Key.")
         st.stop()
 
     try:
-        with st.spinner("Extracting text and auditing inline visual elements..."):
+        with st.spinner("Extracting document text and deduplicating formal captions..."):
             raw_text, asset_meta = extract_text_and_assets(uploaded_file)
             if not raw_text.strip():
                 st.error("Could not extract readable text from the uploaded document.")
                 st.stop()
 
-        with st.spinner("Conducting line-by-line editorial and methodological review..."):
+        with st.spinner("Executing rigorous pre-screening audit with Groq AI..."):
             client = Groq(api_key=groq_api_key)
             audit_result = run_editorial_audit(raw_text, asset_meta, client)
 
-        with st.spinner("Discovering verified regional peer reviewers via OpenAlex..."):
-            keywords = audit_result.get("manuscript_meta", {}).get("keywords", [])
-            reviewers = reviewer_discovery_report(keywords, mailto=openalex_mailto)
+        with st.spinner("Querying OpenAlex for verified regional reviewers..."):
+            detected_title = audit_result.get("manuscript_title", "")
+            reviewers = reviewer_discovery_report(detected_title, mailto=openalex_mailto)
 
-        with st.spinner("Assembling editorial reports..."):
+        with st.spinner("Compiling Word report and blind reviewer copy..."):
             orig_bytes = uploaded_file.getvalue()
             blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
             docx_report = generate_docx_report(audit_result, reviewers)
@@ -612,126 +616,96 @@ if uploaded_file and st.button("🚀 Conduct Line-by-Line Academic Audit", type=
         st.session_state["reviewers"] = reviewers
         st.session_state["blind_bytes"] = blind_bytes
         st.session_state["docx_report"] = docx_report
-        st.success("Manuscript audit completed.")
+        st.success("Audit complete.")
 
     except Exception as e:
-        st.error(f"Audit processing encountered an error: {e}")
-        st.info("Tip: If you encounter token limits, try uploading a slightly shorter excerpt or verify your Groq API key quota.")
+        st.error(f"Audit processing error: {e}")
 
-# Display results if audit completed
+# Render results in structured dashboard (NO RAW JSON DUMP)
 if "audit" in st.session_state:
     audit = st.session_state["audit"]
     reviewers = st.session_state["reviewers"]
-    meta = audit.get("manuscript_meta", {})
-    verdict = meta.get("editorial_verdict", "Under Review")
+    verd = audit.get("editorial_verdict", {})
+    decision = verd.get("decision", "Under Review")
 
     st.markdown("---")
-    v_col1, v_col2 = st.columns([1, 3])
-    with v_col1:
-        if verdict == "Accept with Minor Revisions":
-            st.success(f"### Verdict:\n**{verdict}**")
-        elif verdict == "Major Revisions":
-            st.warning(f"### Verdict:\n**{verdict}**")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if decision == "Accept with Minor Revisions":
+            st.success(f"### Verdict:\n**{decision}**")
+        elif decision == "Major Revisions":
+            st.warning(f"### Verdict:\n**{decision}**")
         else:
-            st.error(f"### Verdict:\n**{verdict}**")
-    with v_col2:
-        st.subheader(meta.get("title", "Manuscript Title"))
-        st.write(f"**Rationale:** {meta.get('verdict_rationale', '')}")
-        st.write("**Extracted Keywords:** " + ", ".join([f"`{k}`" for k in meta.get("keywords", [])]))
+            st.error(f"### Verdict:\n**{decision}**")
+    with c2:
+        st.subheader(audit.get("manuscript_title", "Untitled Manuscript"))
+        st.write(f"**Editorial Summary:** {verd.get('summary_notes', '')}")
 
-    # DASHBOARD TABS (NO RAW JSON DISPLAY)
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏛️ Section 1: Template Audit",
-        "🔬 Section 2: Methodology & Data Logic",
-        "🖼️ Section 3: Visual Asset Integrity",
-        "📝 In-Depth Narrative Critique",
-        "👥 Verified Reviewer Discovery",
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏛️ Structural Section Verification",
+        "🖼️ Visual Asset Audit",
+        "🔬 Methodology & Math Logic",
+        "👥 Verified Reviewer Candidates",
     ])
 
-    # TAB 1: Structural Template Audit
+    # Tab 1: Structural Section Checks
     with tab1:
-        st.subheader("Universal Academic Template Compliance")
-        struct_data = audit.get("structural_template_audit", [])
-        table_rows = []
+        st.subheader("Structural Section Checks")
+        struct_data = audit.get("structural_section_checks", [])
+        rows = []
         for s in struct_data:
-            badge = "🟢 PASS" if s.get("status") == "PASS" else ("🟡 WARN" if s.get("status") == "WARN" else "🔴 FAIL")
-            table_rows.append({
+            stat = s.get("status", "")
+            badge = "🟢 PASS" if stat == "PASS" else ("🟡 WARN" if stat == "WARN" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL"))
+            rows.append({
                 "Section": s.get("section_name"),
-                "Detected": "✅ Yes" if s.get("detected") else "❌ No",
                 "Status": badge,
-                "Heading In Text": s.get("heading_evidence"),
-                "Line-by-Line Critique": s.get("critique"),
+                "Detected Heading": s.get("detected_heading"),
+                "First-Line Quote": s.get("first_line_quote"),
             })
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    # TAB 2: Detailed Methodology & Scientific Audit
+    # Tab 2: Visual Asset Audit
     with tab2:
-        st.subheader("Detailed Methodology & Scientific Rigor")
-        meth = audit.get("detailed_methodology_analysis", {})
-
-        # Sample size
-        sc = meth.get("sample_size_check", {})
-        st.markdown("#### 1. Data & Sample Size Accounting")
-        sc_col1, sc_col2 = st.columns([1, 3])
-        sc_col1.metric("Sample Check Status", sc.get("status", "N/A"), f"N = {sc.get('reported_n', 'N/A')}")
-        sc_col2.info(f"**Filtering & Arithmetic Evaluation:**\n{sc.get('explanation', '')}")
-
-        # Software
-        st.markdown("#### 2. Software Parameters & Reproducibility")
-        sw = meth.get("software_and_reproducibility", {})
-        sw_col1, sw_col2 = st.columns(2)
-        sw_col1.write(f"**Tools & Packages Identified:**\n{sw.get('tools_identified', 'None')}")
-        sw_col2.warning(f"**Missing Parameters & Version Details:**\n{sw.get('missing_parameters', 'None')}")
-
-        # Domain metrics
-        st.markdown("#### 3. Domain-Specific & Scientometric Metrics")
-        dm = meth.get("domain_specific_metrics", {})
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("h-index Reported", "Yes" if dm.get("h_index_present") else "No")
-        m2.metric("g-index Reported", "Yes" if dm.get("g_index_present") else "No")
-        m3.metric("m-index Reported", "Yes" if dm.get("m_index_present") else "No")
-        m4.metric("Counting Method", dm.get("counting_method", "Unspecified"))
-        st.write(f"**Scientometric / Statistical Analysis Notes:**\n{dm.get('analysis_notes', '')}")
-
-    # TAB 3: Visual Asset & Caption Integrity
-    with tab3:
-        st.subheader("Visual Asset & Caption Integrity")
+        st.subheader("Formal Visual Asset Audit")
         v_data = audit.get("visual_asset_audit", [])
         if not v_data:
-            st.info("No figures or tables detected in the document.")
+            st.info("No formal figure or table captions detected.")
         else:
             v_rows = []
             for v in v_data:
-                v_badge = "🟢 PASS" if v.get("status") == "PASS" else "🔴 FAIL"
+                stat = v.get("status", "")
+                badge = "🟢 PASS" if stat == "PASS" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL")
                 v_rows.append({
-                    "Type": v.get("asset_type"),
-                    "Label": v.get("label"),
-                    "Caption Text": v.get("caption"),
+                    "Asset Label": v.get("label"),
                     "Placement": v.get("placement"),
-                    "Inline Graphic Present": "✅ Yes" if v.get("visual_present") else "❌ Missing Graphic",
-                    "Status": v_badge,
+                    "Visual Present": "✅ Yes" if v.get("visual_present") else "❌ No",
+                    "Status": badge,
                 })
             st.dataframe(v_rows, use_container_width=True, hide_index=True)
 
-    # TAB 4: In-Depth Narrative Critique
-    with tab4:
-        st.subheader("In-Depth Scientific Narrative Evaluations")
-        fn = audit.get("facet_narrative_evaluations", {})
-        with st.expander("🔍 Research Problem, Gap & Novelty", expanded=True):
-            st.write(fn.get("research_gap_novelty", "Not evaluated."))
-        with st.expander("🧪 Methodological Rigor & Parameter Clarity", expanded=True):
-            st.write(fn.get("methodological_rigor", "Not evaluated."))
-        with st.expander("📊 Data-Discussion Alignment & Evidence", expanded=True):
-            st.write(fn.get("data_discussion_alignment", "Not evaluated."))
+    # Tab 3: Methodology & Math Logic
+    with tab3:
+        st.subheader("Methodology, Scientometrics & Software Reproducibility")
+        meth = audit.get("methodology_and_math_logic", {})
+        mc1, mc2 = st.columns(2)
+        mc1.metric("Sample Size Accounting", meth.get("sample_size_check", "N/A"))
+        missing = meth.get("missing_domain_metrics", [])
+        mc2.write("**Missing Domain-Specific Metrics (Scientometrics):**")
+        if missing:
+            for m in missing:
+                mc2.markdown(f"- ⚠️ `{m}`")
+        else:
+            mc2.write("✅ None identified as missing.")
+        st.info(f"**Software Reproducibility & Parameter Notes:**\n\n{meth.get('software_reproducibility_notes', 'None recorded.')}")
 
-    # TAB 5: Reviewer Candidates
-    with tab5:
-        st.subheader("Verified OpenAlex Peer Reviewer Candidates")
-        st.caption("Retrieved from publication records based on extracted research keywords. Verified institutional associations.")
+    # Tab 4: OpenAlex Reviewers
+    with tab4:
+        st.subheader("OpenAlex Peer Reviewer Discovery")
+        st.caption("Matched against candidate profiles in verified regional institutions.")
         for region, cands in reviewers.items():
             st.markdown(f"### Region: {region}")
             if not cands or "error" in cands[0]:
-                st.write("No eligible candidates found in this region.")
+                st.write("No matching profiles found.")
                 continue
             r_rows = []
             for c in cands:
@@ -739,13 +713,13 @@ if "audit" in st.session_state:
                 latest_title = pubs[0]["title"] if pubs else "N/A"
                 r_rows.append({
                     "Candidate Name": c.get("name"),
-                    "Affiliated Institution": c.get("institution"),
+                    "Institution": c.get("institution"),
                     "Verified Works": len(pubs),
                     "Recent Representative Publication": latest_title,
                 })
             st.dataframe(r_rows, use_container_width=True, hide_index=True)
 
-    # DOWNLOAD SECTION
+    # Editorial Exports
     st.markdown("---")
     st.subheader("📥 Editorial Exports")
     d1, d2, d3 = st.columns(3)
