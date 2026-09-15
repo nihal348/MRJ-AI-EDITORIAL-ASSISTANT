@@ -102,7 +102,7 @@ def word_count(text: str) -> int:
 
 
 def clean_json_response(raw_resp: str) -> Dict[str, Any]:
-    """Strip markdown wrappers and parse strictly valid JSON."""
+    """Strip markdown wrappers and safely parse JSON."""
     clean = re.sub(r"^```(?:json)?\s*", "", raw_resp.strip(), flags=re.MULTILINE)
     clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE).strip()
     try:
@@ -115,15 +115,11 @@ def clean_json_response(raw_resp: str) -> Dict[str, Any]:
 
 
 # ============================================================
-# DETERMINISTIC PRE-AUDIT WITH HEADING & ABSTRACT FLEXIBILITY
+# DETERMINISTIC PRE-AUDIT & ASSET EXTRACTION
 # ============================================================
 
 def preaudit_sections(text: str) -> List[Dict[str, Any]]:
-    """
-    Scans the document text hierarchy.
-    Applies the Heading Flexibility Rule: if a section's text body/quote is detected
-    (e.g., an unlabelled abstract block in front matter), it is captured as PASS.
-    """
+    """Scan document text hierarchy with Heading & Abstract flexibility."""
     lines = text.splitlines()
     detected_map = {}
 
@@ -147,15 +143,12 @@ def preaudit_sections(text: str) -> List[Dict[str, Any]]:
                     "line_num": i,
                 }
 
-    # ABSTRACT FLEXIBILITY CHECK:
-    # If "Abstract" was not explicitly found via heading regex, scan front matter for the abstract body paragraph.
+    # Abstract Flexibility Rule: scan front matter for unlabelled abstract paragraph
     if "Abstract" not in detected_map:
         intro_line = detected_map.get("Introduction", {}).get("line_num", len(lines))
-        # Look in the region between line 1 and Introduction (or top 35 lines)
         search_limit = min(len(lines), intro_line, 40)
         for idx in range(search_limit):
             l = lines[idx].strip()
-            # If line is a substantial paragraph and not metadata (emails, affiliations, DOIs)
             if (
                 len(l.split()) >= 25
                 and not re.search(r"(?i)@|department\b|university\b|institute\b|received:|accepted:|doi\.org|issn|vol\.\s*\d+", l)
@@ -190,8 +183,8 @@ def preaudit_sections(text: str) -> List[Dict[str, Any]]:
 
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     """
-    Extract full manuscript text while auditing formal visual captions.
-    Deduplicates and ignores narrative in-text mentions (e.g., 'as shown in Figure 2').
+    Extract document text and deduplicate formal captions.
+    Ignores informal narrative mentions (e.g., 'as shown in Figure 2').
     """
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
@@ -266,7 +259,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 
 
 # ============================================================
-# AUDIT JSON SCHEMA
+# AUDIT JSON SCHEMA SPECIFICATION
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
@@ -281,11 +274,20 @@ AUDIT_STRICT_SCHEMA = {
                 "properties": {
                     "decision": {
                         "type": "string",
-                        "enum": ["Accept with Minor Revisions", "Major Revisions", "Reject"],
+                        "enum": [
+                            "Accept as is",
+                            "Accept with Minor Revisions",
+                            "Major Revisions",
+                            "Reject",
+                        ],
+                    },
+                    "verdict_rationale": {
+                        "type": "array",
+                        "items": {"type": "string"},
                     },
                     "summary_notes": {"type": "string"},
                 },
-                "required": ["decision", "summary_notes"],
+                "required": ["decision", "verdict_rationale", "summary_notes"],
                 "additionalProperties": False,
             },
             "structural_section_checks": {
@@ -356,42 +358,35 @@ AUDIT_STRICT_SCHEMA = {
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute rigorous pre-screening audit enforcing heading flexibility and evidence verification."""
+    """Execute rigorous pre-screening audit enforcing all critical audit rules."""
     preaudited = preaudit_sections(raw_text)
 
     prompt = f"""You are an expert scientific manuscript editorial auditor. Conduct a thorough, evidence-based pre-screening audit of the provided manuscript.
 
-CRITICAL INSTRUCTIONS & CONSTRAINTS:
+CRITICAL AUDIT RULES:
 
-1. ABSTRACT & HEADING FLEXIBILITY RULE:
-   - If a section's text body or first-line quote is detected (e.g., the abstract paragraph at the start of the paper), mark its status as "PASS", even if the explicit section heading word (e.g., "ABSTRACT") is absent or unformatted.
-   - In "detected_heading", report "Implicit / Body Detected" or the specific format found if the explicit heading label was missing.
-   - Assign "FAIL" ONLY if both the heading AND the body text/quote are completely absent from a full manuscript.
+1. VERDICT CALIBRATION & CLEAR AUTHOR RATIONALE (STRICT):
+   - DO NOT assign "Major Revisions" or "Reject" solely for missing optional sections (e.g., Ethics Statement, Acknowledgments) or minor software parameter omissions if all core empirical sections (Abstract, Introduction, Methods, Results, Conclusion) are PASS.
+   - Assign "Accept with Minor Revisions" when core content is intact but minor declarations or parameters are missing.
+   - For EVERY verdict, you MUST provide an explicit, bulleted array in "verdict_rationale" listing the exact reasons for the decision so the author knows precisely what needs revision.
 
-2. ABSENCE VERIFICATION & EXCERPT HANDLING:
-   - Do NOT mark a section as "NOT EVALUATED (EXCERPT PROVIDED)" if the text or heading is present in the document.
-   - Scan the ENTIRE document text hierarchy from top to bottom before assigning a section status.
-   - Assign "PASS" if the section heading OR its corresponding body text/quotes are found.
-   - Assign "NOT EVALUATED (EXCERPT PROVIDED)" ONLY if the manuscript file is demonstrably cut off mid-text and no body text was provided for that section.
-   - Assign "FAIL" ONLY if both the heading AND the body text/quote are completely absent from a full manuscript.
-   - Assign "WARN" for missing optional sections (e.g., Acknowledgments, Funding, Ethics Statement, AI Usage).
+2. EXCERPT & TRUNCATION SAFETY CONSTRAINT:
+   - Do NOT mark a section as "FAIL" or "Not Found" if you are evaluating an incomplete excerpt or fragment of a document.
+   - If a section is absent due to document truncation, mark its status strictly as "NOT EVALUATED (EXCERPT PROVIDED)".
+   - Mark a section as "FAIL" ONLY if the manuscript is complete and a required core section is missing entirely.
 
-3. EVIDENCE-BASED AUDITING:
-   - For EVERY section evaluated, you MUST extract and provide an exact first-line text quote from the manuscript as proof of existence. Do NOT leave quotes blank if the section text exists.
+3. ABSTRACT & HEADING FLEXIBILITY RULE:
+   - If a section's text body or first-line quote is detected (e.g., the abstract paragraph at the top of the paper), mark its status as "PASS" or "WARN", even if an explicit section heading like "ABSTRACT" is absent or unformatted.
 
 4. MANUSCRIPT TITLE RESOLUTION:
-   - Extract the full, actual academic article title (e.g., "Consumer Perception, Food Waste and Food Packaging Research...").
+   - Extract the full, actual academic article title.
    - NEVER output a DOI link, URL string, header metadata, or journal name as the manuscript title.
 
-5. VISUAL ASSET & CAPTION AUDIT:
-   - Audit formal table and figure captions (e.g., "Table 1: ...", "Figure 2: ...").
-   - Deduplicate narrative text mentions: Do NOT create separate entries for in-text sentence mentions (e.g., ignore sentences like "as shown in Figure 2").
-
-6. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
+5. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
    - For bibliometric/scientometric studies, explicitly audit and report whether standard domain metrics are present: h-index, g-index, m-index.
-   - Audit software reproducibility: check if version numbers, parameter settings, or normalization techniques (e.g., VOSviewer, Biblioshiny, CiteSpace) are explicitly detailed.
+   - For empirical/survey studies, audit for software version numbers, statistical parameter settings, or sample size justifications.
 
-PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT (INCLUDING IMPLICIT BODY PARAGRAPHS):
+PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT:
 {json.dumps(preaudited, indent=2)}
 
 PRE-SCANNED FORMAL VISUAL CAPTIONS:
@@ -595,6 +590,13 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
     doc.add_paragraph(f"Decision: {verd.get('decision', 'Under Review')}")
     doc.add_paragraph(f"Summary Notes: {verd.get('summary_notes', '')}")
 
+    # Actionable revision requirements
+    rationale_list = verd.get("verdict_rationale", [])
+    if rationale_list:
+        doc.add_heading("Actionable Revision Requirements for Authors:", level=2)
+        for r_item in rationale_list:
+            doc.add_paragraph(f"• {r_item}")
+
     doc.add_heading("1. Structural Section Verification", level=1)
     tbl = doc.add_table(rows=1, cols=4)
     tbl.style = "Table Grid"
@@ -652,10 +654,10 @@ with st.sidebar:
     openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editorial-auditor@mrjournal.org"))
     st.markdown("---")
     st.markdown("**Critical Pre-Screening Directives:**")
-    st.markdown("1. **Abstract & Heading Flexibility**: Section passes if body text/quote is found, even if unlabelled.")
-    st.markdown("2. **Evidence-Based Quotes**: Verifies first-line quotes for every section.")
-    st.markdown("3. **Title Resolution**: Full article title; no DOIs/URLs.")
-    st.markdown("4. **Asset Deduplication**: Audits formal captions only.")
+    st.markdown("1. **Verdict Calibration**: Actionable bulleted revision requirements; no harsh rejection solely for optional omissions.")
+    st.markdown("2. **Truncation Safety**: Missing sections in excerpts marked as `NOT EVALUATED (EXCERPT PROVIDED)`.")
+    st.markdown("3. **Abstract & Heading Flexibility**: Section passes if body text/quote is found, even if unlabelled.")
+    st.markdown("4. **Title Resolution**: Full article title; no DOIs/URLs.")
     st.markdown("5. **Scientometrics**: Checks h/g/m indices & software parameters.")
 
 uploaded_file = st.file_uploader("Upload Manuscript (.pdf or .docx)", type=["pdf", "docx"])
@@ -704,8 +706,10 @@ if "audit" in st.session_state:
     st.markdown("---")
     c1, c2 = st.columns([1, 3])
     with c1:
-        if decision == "Accept with Minor Revisions":
+        if decision == "Accept as is":
             st.success(f"### Verdict:\n**{decision}**")
+        elif decision == "Accept with Minor Revisions":
+            st.info(f"### Verdict:\n**{decision}**")
         elif decision == "Major Revisions":
             st.warning(f"### Verdict:\n**{decision}**")
         else:
@@ -713,6 +717,11 @@ if "audit" in st.session_state:
     with c2:
         st.subheader(audit.get("manuscript_title", "Untitled Manuscript"))
         st.write(f"**Editorial Summary:** {verd.get('summary_notes', '')}")
+        rationale_items = verd.get("verdict_rationale", [])
+        if rationale_items:
+            st.markdown("**Actionable Revision Requirements for Authors:**")
+            for r_item in rationale_items:
+                st.markdown(f"- ⚠️ {r_item}")
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "🏛️ Structural Section Verification",
