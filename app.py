@@ -515,4 +515,232 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
     d_meth = audit.get("detailed_methodology_analysis", {})
     s_check = d_meth.get("sample_size_check", {})
     doc.add_paragraph(f"Sample Size Accounting: [{s_check.get('status', 'N/A')}] Reported N = {s_check.get('reported_n', 'N/A')}")
-    doc.add_paragraph(f"
+    doc.add_paragraph(f"Filtering Logic: {s_check.get('explanation', '')}")
+
+    s_rep = d_meth.get("software_and_reproducibility", {})
+    doc.add_paragraph(f"Software Tools: {s_rep.get('tools_identified', 'None')}")
+    doc.add_paragraph(f"Missing Parameters: {s_rep.get('missing_parameters', 'None')}")
+
+    d_metr = d_meth.get("domain_specific_metrics", {})
+    doc.add_paragraph(f"Counting Method: {d_metr.get('counting_method', 'Unspecified')}")
+    doc.add_paragraph(f"Domain Metrics Notes: {d_metr.get('analysis_notes', '')}")
+
+    # Section 3
+    doc.add_heading("3. Visual Asset & Caption Integrity", level=1)
+    for v in audit.get("visual_asset_audit", []):
+        doc.add_paragraph(f"• {v.get('asset_type')} {v.get('label')} [{v.get('status')}]: {v.get('caption')} (Placement: {v.get('placement')}, Inline Graphic Present: {v.get('visual_present')})")
+
+    # Section 4
+    doc.add_heading("4. Reviewer Candidates (OpenAlex)", level=1)
+    for reg, cands in reviewers.items():
+        doc.add_heading(reg, level=2)
+        for c in cands:
+            if "name" in c:
+                doc.add_paragraph(f"- {c['name']} ({c.get('institution', 'N/A')}): {len(c.get('recent_pubs', []))} verified publications")
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+# ============================================================
+# STREAMLIT UI (HUMAN-READABLE DASHBOARD, NO RAW JSON)
+# ============================================================
+
+st.set_page_config(page_title="Academic Manuscript Audit", page_icon="🎓", layout="wide")
+st.title("🎓 Academic Editorial Pre-Screening & Scientific Audit")
+st.caption("Universal template compliance, methodological logic & sample size validation, and visual asset integrity.")
+
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    groq_api_key = st.text_input("Groq API Key", value=get_secret("GROQ_API_KEY"), type="password")
+    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editor@academicprescreen.org"))
+    st.markdown("---")
+    st.markdown("**Strict Scientific Checkpoints:**")
+    st.markdown("1. **Structural Audit**: Abstract 200–250w, IMRaD, Declarations & Governance.")
+    st.markdown("2. **Methodology Audit**: Sample accounting ($N$), h/g/m indices, counting logic.")
+    st.markdown("3. **Visual Integrity**: Inline graphic verification for every caption.")
+
+uploaded_file = st.file_uploader("Upload Manuscript (.pdf or .docx)", type=["pdf", "docx"])
+
+if uploaded_file and st.button("🚀 Conduct Line-by-Line Academic Audit", type="primary"):
+    if not groq_api_key:
+        st.error("Please provide a valid Groq API Key.")
+        st.stop()
+
+    with st.spinner("Extracting text and auditing inline visual elements..."):
+        raw_text, asset_meta = extract_text_and_assets(uploaded_file)
+
+    with st.spinner("Conducting line-by-line editorial and methodological review..."):
+        client = Groq(api_key=groq_api_key)
+        audit_result = run_editorial_audit(raw_text, asset_meta, client)
+
+    with st.spinner("Discovering verified regional peer reviewers via OpenAlex..."):
+        keywords = audit_result.get("manuscript_meta", {}).get("keywords", [])
+        reviewers = reviewer_discovery_report(keywords, mailto=openalex_mailto)
+
+    with st.spinner("Assembling editorial reports..."):
+        orig_bytes = uploaded_file.getvalue()
+        blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
+        docx_report = generate_docx_report(audit_result, reviewers)
+
+    st.session_state["audit"] = audit_result
+    st.session_state["reviewers"] = reviewers
+    st.session_state["blind_bytes"] = blind_bytes
+    st.session_state["docx_report"] = docx_report
+    st.success("Manuscript audit completed.")
+
+# Display results if audit completed
+if "audit" in st.session_state:
+    audit = st.session_state["audit"]
+    reviewers = st.session_state["reviewers"]
+    meta = audit.get("manuscript_meta", {})
+    verdict = meta.get("editorial_verdict", "Under Review")
+
+    # Header Card
+    st.markdown("---")
+    v_col1, v_col2 = st.columns([1, 3])
+    with v_col1:
+        if verdict == "Accept with Minor Revisions":
+            st.success(f"### Verdict:\n**{verdict}**")
+        elif verdict == "Major Revisions":
+            st.warning(f"### Verdict:\n**{verdict}**")
+        else:
+            st.error(f"### Verdict:\n**{verdict}**")
+    with v_col2:
+        st.subheader(meta.get("title", "Manuscript Title"))
+        st.write(f"**Rationale:** {meta.get('verdict_rationale', '')}")
+        st.write("**Extracted Keywords:** " + ", ".join([f"`{k}`" for k in meta.get("keywords", [])]))
+
+    # Dashboard Tabs (NO RAW JSON DISPLAY)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🏛️ Section 1: Template Audit",
+        "🔬 Section 2: Methodology & Data Logic",
+        "🖼️ Section 3: Visual Asset Integrity",
+        "📝 In-Depth Narrative Critique",
+        "👥 Verified Reviewer Discovery",
+    ])
+
+    # TAB 1: Structural Template Audit
+    with tab1:
+        st.subheader("Universal Academic Template Compliance")
+        struct_data = audit.get("structural_template_audit", [])
+        table_rows = []
+        for s in struct_data:
+            badge = "🟢 PASS" if s.get("status") == "PASS" else ("🟡 WARN" if s.get("status") == "WARN" else "🔴 FAIL")
+            table_rows.append({
+                "Section": s.get("section_name"),
+                "Detected": "✅ Yes" if s.get("detected") else "❌ No",
+                "Status": badge,
+                "Heading In Text": s.get("heading_evidence"),
+                "Line-by-Line Critique": s.get("critique"),
+            })
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+    # TAB 2: Detailed Methodology & Scientific Audit
+    with tab2:
+        st.subheader("Detailed Methodology & Scientific Rigor")
+        meth = audit.get("detailed_methodology_analysis", {})
+
+        # 1. Sample Size Check
+        sc = meth.get("sample_size_check", {})
+        st.markdown("#### 1. Data & Sample Size Accounting")
+        sc_col1, sc_col2 = st.columns([1, 3])
+        sc_col1.metric("Sample Check Status", sc.get("status", "N/A"), f"N = {sc.get('reported_n', 'N/A')}")
+        sc_col2.info(f"**Filtering & Arithmetic Evaluation:**\n{sc.get('explanation', '')}")
+
+        # 2. Software & Reproducibility
+        st.markdown("#### 2. Software Parameters & Reproducibility")
+        sw = meth.get("software_and_reproducibility", {})
+        sw_col1, sw_col2 = st.columns(2)
+        sw_col1.write(f"**Tools & Packages Identified:**\n{sw.get('tools_identified', 'None')}")
+        sw_col2.warning(f"**Missing Parameters & Version Details:**\n{sw.get('missing_parameters', 'None')}")
+
+        # 3. Domain Specific Metrics
+        st.markdown("#### 3. Domain-Specific & Scientometric Metrics")
+        dm = meth.get("domain_specific_metrics", {})
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("h-index Reported", "Yes" if dm.get("h_index_present") else "No")
+        m2.metric("g-index Reported", "Yes" if dm.get("g_index_present") else "No")
+        m3.metric("m-index Reported", "Yes" if dm.get("m_index_present") else "No")
+        m4.metric("Counting Method", dm.get("counting_method", "Unspecified"))
+        st.write(f"**Scientometric / Statistical Analysis Notes:**\n{dm.get('analysis_notes', '')}")
+
+    # TAB 3: Visual Asset & Caption Integrity
+    with tab3:
+        st.subheader("Visual Asset & Caption Integrity")
+        v_data = audit.get("visual_asset_audit", [])
+        if not v_data:
+            st.info("No figures or tables detected in the document.")
+        else:
+            v_rows = []
+            for v in v_data:
+                v_badge = "🟢 PASS" if v.get("status") == "PASS" else "🔴 FAIL"
+                v_rows.append({
+                    "Type": v.get("asset_type"),
+                    "Label": v.get("label"),
+                    "Caption Text": v.get("caption"),
+                    "Placement": v.get("placement"),
+                    "Inline Graphic Present": "✅ Yes" if v.get("visual_present") else "❌ Missing Graphic",
+                    "Status": v_badge,
+                })
+            st.dataframe(v_rows, use_container_width=True, hide_index=True)
+
+    # TAB 4: In-Depth Narrative Critique
+    with tab4:
+        st.subheader("In-Depth Scientific Narrative Evaluations")
+        fn = audit.get("facet_narrative_evaluations", {})
+        with st.expander("🔍 Research Problem, Gap & Novelty", expanded=True):
+            st.write(fn.get("research_gap_novelty", "Not evaluated."))
+        with st.expander("🧪 Methodological Rigor & Parameter Clarity", expanded=True):
+            st.write(fn.get("methodological_rigor", "Not evaluated."))
+        with st.expander("📊 Data-Discussion Alignment & Evidence", expanded=True):
+            st.write(fn.get("data_discussion_alignment", "Not evaluated."))
+
+    # TAB 5: Reviewer Candidates
+    with tab5:
+        st.subheader("Verified OpenAlex Peer Reviewer Candidates")
+        st.caption("Retrieved from publication records based on extracted research keywords. Verified institutional associations.")
+        for region, cands in reviewers.items():
+            st.markdown(f"### Region: {region}")
+            if not cands or "error" in cands[0]:
+                st.write("No eligible candidates found in this region.")
+                continue
+            r_rows = []
+            for c in cands:
+                pubs = c.get("recent_pubs", [])
+                latest_title = pubs[0]["title"] if pubs else "N/A"
+                r_rows.append({
+                    "Candidate Name": c.get("name"),
+                    "Affiliated Institution": c.get("institution"),
+                    "Verified Works": len(pubs),
+                    "Recent Representative Publication": latest_title,
+                })
+            st.dataframe(r_rows, use_container_width=True, hide_index=True)
+
+    # DOWNLOAD SECTION
+    st.markdown("---")
+    st.subheader("📥 Editorial Exports")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button(
+        "📄 Download Editorial Report (.docx)",
+        data=st.session_state["docx_report"],
+        file_name="Editorial_Audit_Report.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
+    )
+    if uploaded_file.name.endswith(".docx"):
+        d2.download_button(
+            "🙈 Download Anonymized Blind Copy (.docx)",
+            data=st.session_state["blind_bytes"],
+            file_name="Anonymized_Reviewer_Copy.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+    d3.download_button(
+        "💾 Download Audit Data (.json)",
+        data=json.dumps(audit, indent=2),
+        file_name="audit_data.json",
+        mime="application/json",
+        use_container_width=True,
+    )
