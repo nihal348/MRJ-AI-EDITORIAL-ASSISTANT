@@ -9,14 +9,16 @@ import requests
 import streamlit as st
 from docx import Document
 from docx.text.paragraph import Paragraph
-from groq import Groq
+from groq import Groq, BadRequestError, RateLimitError
 
 
 # ============================================================
 # CONFIGURATION & CONSTANTS
 # ============================================================
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+PRIMARY_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODEL = "llama-3.3-70b-versatile"
+
 OPENALEX_URL = "https://api.openalex.org/works"
 OPENALEX_AUTHOR_URL = "https://api.openalex.org/authors"
 
@@ -90,6 +92,21 @@ def word_count(text: str) -> int:
     return len(re.findall(r"\b[\w'-]+\b", text or ""))
 
 
+def clean_json_response(raw_resp: str) -> Dict[str, Any]:
+    """Parse JSON text, stripping potential markdown fences and cleaning invalid control characters."""
+    clean = re.sub(r"^```(?:json)?\s*", "", raw_resp.strip(), flags=re.MULTILINE)
+    clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE)
+    clean = clean.strip()
+    try:
+        return json.loads(clean)
+    except Exception:
+        # Match the outermost JSON object if surrounding commentary exists
+        match = re.search(r"(\{.*\})", clean, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        raise ValueError("Could not parse valid JSON from AI completion.")
+
+
 # ============================================================
 # ASSET & SECTION EXTRACTION
 # ============================================================
@@ -157,30 +174,8 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     raise ValueError("Unsupported format. Please upload a .docx or .pdf file.")
 
 
-def extract_section_excerpts(text: str) -> Dict[str, str]:
-    """Segment text into core sections for focused model evaluation."""
-    lines = text.splitlines()
-    found: Dict[str, int] = {}
-
-    for i, line in enumerate(lines):
-        clean = normalize(line)
-        if not clean or len(clean) > 85:
-            continue
-        for canonical, pattern in SECTION_PATTERNS.items():
-            if canonical not in found and re.match(pattern, clean):
-                found[canonical] = i
-
-    sorted_sections = sorted(found.items(), key=lambda x: x[1])
-    excerpts = {}
-    for idx, (canonical, start_line) in enumerate(sorted_sections):
-        end_line = sorted_sections[idx + 1][1] if idx + 1 < len(sorted_sections) else len(lines)
-        excerpts[canonical] = "\n".join(lines[start_line:end_line]).strip()
-
-    return excerpts
-
-
 # ============================================================
-# GROQ STRUCTURED AUDIT ENGINE (EXACT SCHEMA COMPLIANCE)
+# AUDIT JSON SCHEMA SPECIFICATION
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
@@ -223,10 +218,10 @@ AUDIT_STRICT_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "asset_type": {"type": "string", "enum": ["Table", "Figure"]},
+                        "asset_type": {"type": "string"},
                         "label": {"type": "string"},
                         "caption": {"type": "string"},
-                        "placement": {"type": "string", "enum": ["Inline Body", "Appendix", "Missing"]},
+                        "placement": {"type": "string"},
                         "visual_present": {"type": "boolean"},
                         "status": {"type": "string", "enum": ["PASS", "FAIL"]},
                     },
@@ -264,10 +259,7 @@ AUDIT_STRICT_SCHEMA = {
                             "h_index_present": {"type": "boolean"},
                             "g_index_present": {"type": "boolean"},
                             "m_index_present": {"type": "boolean"},
-                            "counting_method": {
-                                "type": "string",
-                                "enum": ["Full-counting", "Fractional-counting", "Unspecified"],
-                            },
+                            "counting_method": {"type": "string"},
                             "analysis_notes": {"type": "string"},
                         },
                         "required": ["status", "h_index_present", "g_index_present", "m_index_present", "counting_method", "analysis_notes"],
@@ -300,10 +292,12 @@ AUDIT_STRICT_SCHEMA = {
 }
 
 
-def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute the full editorial line-by-line audit across all 3 directive sections."""
-    excerpts = extract_section_excerpts(raw_text)
+# ============================================================
+# RESILIENT GROQ AUDIT ENGINE (PREVENTS 400 BAD REQUEST)
+# ============================================================
 
+def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
+    """Execute the editorial audit with multiple fallback layers against HTTP 400 Bad Request."""
     prompt = f"""You are a senior academic peer reviewer and editorial prescreening manager. Conduct a rigorous, line-by-line audit of this manuscript text.
 
 ASSET METADATA (Cross-modal visual detection):
@@ -314,46 +308,78 @@ ASSET METADATA (Cross-modal visual detection):
 --- SECTION 1: UNIVERSAL ACADEMIC TEMPLATE AUDIT ---
 Evaluate each required section:
 {json.dumps(REQUIRED_TEMPLATE_SECTIONS)}
-1. Title & Abstract: Check if Abstract exceeds 200–250 words and if structured (Background, Methods, Results, Conclusion). Extract 3–5 key keywords.
-2. Introduction: Must clearly state Research Problem, Background, and highlight Research Gap/Novelty.
-3. Materials and Methods: Check for exact software versions, parameter settings, algorithm choices, normalization methods, and search strings.
+1. Title & Abstract: Check if Abstract exceeds 200–250 words and if structured. Extract 3–5 key keywords.
+2. Introduction: Check Research Problem, Background, and Research Gap/Novelty.
+3. Materials and Methods: Check software versions, parameter settings, algorithm choices, normalization methods, and search strings.
 4. Results and Discussion: Check if findings are backed by data.
-5. Conclusions: Must summarize main findings, implications, and limitations.
-6. Declarations & Governance: Verify presence of Funding, Conflicts of Interest, AI Usage, Acknowledgments, and Ethics Approval.
+5. Conclusions: Summarize main findings, implications, and limitations.
+6. Declarations: Verify Funding, Conflicts of Interest, AI Usage, Acknowledgments, Ethics Approval.
 
 --- SECTION 2: DETAILED METHODOLOGY & SCIENTIFIC AUDIT ---
-1. Data & Sample Size Accounting: Verify mathematical consistency between raw dataset, filters, and final sample size (N).
-2. Bibliometric/Scientometric indicators (if applicable):
-   - Check h-index, g-index, m-index.
-   - Verify parameters for VOSviewer, Bibliometrix (Biblioshiny), CiteSpace, Pajek.
-   - Verify network normalization methods (Association Strength, Fractionalization, Cosine Similarity).
-   - Check counting logic (Full-counting vs. Fractional-counting).
-3. Non-Bibliometric studies: Check sample size justification, statistical test assumptions, power analysis, PRISMA flow.
+1. Data & Sample Size Accounting: Mathematical consistency between raw data, filtering steps, and final sample size (N).
+2. Bibliometric indicators: Check h-index, g-index, m-index, software versions (VOSviewer, Biblioshiny), normalization, and counting logic (Full vs Fractional).
+3. Non-Bibliometric studies: Sample size justification, statistical assumptions, power analysis, PRISMA flow.
 
 --- SECTION 3: VISUAL ASSET & CAPTION INTEGRITY ---
 Audit all Figures and Tables. Confirm whether inline embedded assets exist for every caption found.
 
 MANUSCRIPT EXCERPTS:
 --- START OF TEXT ---
-{raw_text[:14000]}
+{raw_text[:12000]}
 --- END OF TEXT ---
 
-Return ONLY valid JSON matching the schema."""
+Return strictly a valid JSON object matching the requested schema."""
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a senior academic peer reviewer. Audit the manuscript thoroughly with zero hallucinations. Output strictly valid JSON.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        response_format={"type": "json_schema", "json_schema": AUDIT_STRICT_SCHEMA},
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a senior academic peer reviewer. Audit the manuscript thoroughly with zero hallucinations. Output strictly valid JSON.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    # ATTEMPT 1: Primary model with json_schema and explicit token budget
+    try:
+        resp = client.chat.completions.create(
+            model=PRIMARY_MODEL,
+            messages=messages,
+            temperature=0.1,
+            reasoning_effort="low",
+            include_reasoning=False,
+            max_completion_tokens=4500,
+            response_format={"type": "json_schema", "json_schema": AUDIT_STRICT_SCHEMA},
+        )
+        content = resp.choices[0].message.content or "{}"
+        return clean_json_response(content)
+    except (BadRequestError, Exception) as e1:
+        st.warning(f"Note: Primary structured call adjusted due to provider constraints ({type(e1).__name__}). Switching to JSON mode fallback.")
+
+    # ATTEMPT 2: Primary model with json_object mode (universal JSON enforcement)
+    try:
+        resp = client.chat.completions.create(
+            model=PRIMARY_MODEL,
+            messages=messages,
+            temperature=0.1,
+            reasoning_effort="low",
+            include_reasoning=False,
+            max_completion_tokens=4500,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content or "{}"
+        return clean_json_response(content)
+    except (BadRequestError, Exception) as e2:
+        st.warning(f"Note: Secondary fallback invoked on stable model {FALLBACK_MODEL}.")
+
+    # ATTEMPT 3: Fallback model (llama-3.3-70b-versatile) with json_object mode
+    resp = client.chat.completions.create(
+        model=FALLBACK_MODEL,
+        messages=messages,
+        temperature=0.1,
+        max_completion_tokens=4000,
+        response_format={"type": "json_object"},
     )
-
-    return json.loads(response.choices[0].message.content or "{}")
+    content = resp.choices[0].message.content or "{}"
+    return clean_json_response(content)
 
 
 # ============================================================
@@ -462,7 +488,6 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
             break
 
     if abstract_idx is not None and abstract_idx > 1:
-        # Keep title (first non-empty paragraph), delete author block
         first_kept = False
         for i in range(abstract_idx):
             txt = paras[i].text.strip()
@@ -474,7 +499,6 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
             p_elem = paras[i]._element
             p_elem.getparent().remove(p_elem)
 
-    # Redact email and ORCID
     for p in doc.paragraphs:
         for r in p.runs:
             r.text = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[REDACTED EMAIL]", r.text, flags=re.I)
@@ -497,7 +521,6 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
     doc.add_paragraph(f"Editorial Verdict: {meta.get('editorial_verdict', 'Under Review')}")
     doc.add_paragraph(f"Verdict Rationale: {meta.get('verdict_rationale', '')}")
 
-    # Section 1
     doc.add_heading("1. Universal Academic Template Audit", level=1)
     tbl = doc.add_table(rows=1, cols=4)
     tbl.style = "Table Grid"
@@ -510,7 +533,6 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
         row[2].text = item.get("status", "")
         row[3].text = item.get("critique", "")
 
-    # Section 2
     doc.add_heading("2. Detailed Methodology & Scientific Audit", level=1)
     d_meth = audit.get("detailed_methodology_analysis", {})
     s_check = d_meth.get("sample_size_check", {})
@@ -525,12 +547,10 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
     doc.add_paragraph(f"Counting Method: {d_metr.get('counting_method', 'Unspecified')}")
     doc.add_paragraph(f"Domain Metrics Notes: {d_metr.get('analysis_notes', '')}")
 
-    # Section 3
     doc.add_heading("3. Visual Asset & Caption Integrity", level=1)
     for v in audit.get("visual_asset_audit", []):
-        doc.add_paragraph(f"• {v.get('asset_type')} {v.get('label')} [{v.get('status')}]: {v.get('caption')} (Placement: {v.get('placement')}, Inline Graphic Present: {v.get('visual_present')})")
+        doc.add_paragraph(f"• {v.get('asset_type')} {v.get('label')} [{v.get('status')}]: {v.get('caption')} (Placement: {v.get('placement')}, Graphic Present: {v.get('visual_present')})")
 
-    # Section 4
     doc.add_heading("4. Reviewer Candidates (OpenAlex)", level=1)
     for reg, cands in reviewers.items():
         doc.add_heading(reg, level=2)
@@ -544,7 +564,7 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
 
 
 # ============================================================
-# STREAMLIT UI (HUMAN-READABLE DASHBOARD, NO RAW JSON)
+# STREAMLIT UI (STRUCTURED DASHBOARD - NO RAW JSON)
 # ============================================================
 
 st.set_page_config(page_title="Academic Manuscript Audit", page_icon="🎓", layout="wide")
@@ -568,27 +588,35 @@ if uploaded_file and st.button("🚀 Conduct Line-by-Line Academic Audit", type=
         st.error("Please provide a valid Groq API Key.")
         st.stop()
 
-    with st.spinner("Extracting text and auditing inline visual elements..."):
-        raw_text, asset_meta = extract_text_and_assets(uploaded_file)
+    try:
+        with st.spinner("Extracting text and auditing inline visual elements..."):
+            raw_text, asset_meta = extract_text_and_assets(uploaded_file)
+            if not raw_text.strip():
+                st.error("Could not extract readable text from the uploaded document.")
+                st.stop()
 
-    with st.spinner("Conducting line-by-line editorial and methodological review..."):
-        client = Groq(api_key=groq_api_key)
-        audit_result = run_editorial_audit(raw_text, asset_meta, client)
+        with st.spinner("Conducting line-by-line editorial and methodological review..."):
+            client = Groq(api_key=groq_api_key)
+            audit_result = run_editorial_audit(raw_text, asset_meta, client)
 
-    with st.spinner("Discovering verified regional peer reviewers via OpenAlex..."):
-        keywords = audit_result.get("manuscript_meta", {}).get("keywords", [])
-        reviewers = reviewer_discovery_report(keywords, mailto=openalex_mailto)
+        with st.spinner("Discovering verified regional peer reviewers via OpenAlex..."):
+            keywords = audit_result.get("manuscript_meta", {}).get("keywords", [])
+            reviewers = reviewer_discovery_report(keywords, mailto=openalex_mailto)
 
-    with st.spinner("Assembling editorial reports..."):
-        orig_bytes = uploaded_file.getvalue()
-        blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
-        docx_report = generate_docx_report(audit_result, reviewers)
+        with st.spinner("Assembling editorial reports..."):
+            orig_bytes = uploaded_file.getvalue()
+            blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
+            docx_report = generate_docx_report(audit_result, reviewers)
 
-    st.session_state["audit"] = audit_result
-    st.session_state["reviewers"] = reviewers
-    st.session_state["blind_bytes"] = blind_bytes
-    st.session_state["docx_report"] = docx_report
-    st.success("Manuscript audit completed.")
+        st.session_state["audit"] = audit_result
+        st.session_state["reviewers"] = reviewers
+        st.session_state["blind_bytes"] = blind_bytes
+        st.session_state["docx_report"] = docx_report
+        st.success("Manuscript audit completed.")
+
+    except Exception as e:
+        st.error(f"Audit processing encountered an error: {e}")
+        st.info("Tip: If you encounter token limits, try uploading a slightly shorter excerpt or verify your Groq API key quota.")
 
 # Display results if audit completed
 if "audit" in st.session_state:
@@ -597,7 +625,6 @@ if "audit" in st.session_state:
     meta = audit.get("manuscript_meta", {})
     verdict = meta.get("editorial_verdict", "Under Review")
 
-    # Header Card
     st.markdown("---")
     v_col1, v_col2 = st.columns([1, 3])
     with v_col1:
@@ -612,7 +639,7 @@ if "audit" in st.session_state:
         st.write(f"**Rationale:** {meta.get('verdict_rationale', '')}")
         st.write("**Extracted Keywords:** " + ", ".join([f"`{k}`" for k in meta.get("keywords", [])]))
 
-    # Dashboard Tabs (NO RAW JSON DISPLAY)
+    # DASHBOARD TABS (NO RAW JSON DISPLAY)
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🏛️ Section 1: Template Audit",
         "🔬 Section 2: Methodology & Data Logic",
@@ -642,21 +669,21 @@ if "audit" in st.session_state:
         st.subheader("Detailed Methodology & Scientific Rigor")
         meth = audit.get("detailed_methodology_analysis", {})
 
-        # 1. Sample Size Check
+        # Sample size
         sc = meth.get("sample_size_check", {})
         st.markdown("#### 1. Data & Sample Size Accounting")
         sc_col1, sc_col2 = st.columns([1, 3])
         sc_col1.metric("Sample Check Status", sc.get("status", "N/A"), f"N = {sc.get('reported_n', 'N/A')}")
         sc_col2.info(f"**Filtering & Arithmetic Evaluation:**\n{sc.get('explanation', '')}")
 
-        # 2. Software & Reproducibility
+        # Software
         st.markdown("#### 2. Software Parameters & Reproducibility")
         sw = meth.get("software_and_reproducibility", {})
         sw_col1, sw_col2 = st.columns(2)
         sw_col1.write(f"**Tools & Packages Identified:**\n{sw.get('tools_identified', 'None')}")
         sw_col2.warning(f"**Missing Parameters & Version Details:**\n{sw.get('missing_parameters', 'None')}")
 
-        # 3. Domain Specific Metrics
+        # Domain metrics
         st.markdown("#### 3. Domain-Specific & Scientometric Metrics")
         dm = meth.get("domain_specific_metrics", {})
         m1, m2, m3, m4 = st.columns(4)
