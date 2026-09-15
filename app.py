@@ -13,7 +13,7 @@ from groq import Groq, BadRequestError
 
 
 # ============================================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION & MRJ TEMPLATE CONSTANTS
 # ============================================================
 
 PRIMARY_MODEL = "openai/gpt-oss-120b"
@@ -22,6 +22,7 @@ FALLBACK_MODEL = "llama-3.3-70b-versatile"
 OPENALEX_URL = "https://api.openalex.org/works"
 OPENALEX_AUTHOR_URL = "https://api.openalex.org/authors"
 
+# MRJ Template Required Sections (in order of template appearance)
 REQUIRED_TEMPLATE_SECTIONS = [
     "Abstract",
     "Introduction",
@@ -43,6 +44,7 @@ CORE_SECTIONS = {
     "Materials and Methods",
     "Results and Discussion",
     "Conclusions",
+    "Multidisciplinary Domains",
     "References",
 }
 
@@ -68,7 +70,7 @@ THESIS_SUBHEADING_PATTERNS = [
     r"(?i)\b(?:research questions?)\b",
     r"(?i)\b(?:delimitations?|scope and delimitations?)\b",
     r"(?i)\b(?:significance of (?:the )?study)\b",
-    r"(?i)\b(?:conceptual framework|theoretical framework)\b",
+    r"(?i)\b(?:conceptual framework)\b",
 ]
 
 NORTHEAST_STATES = {
@@ -80,7 +82,7 @@ NORTHEAST_INSTITUTION_TERMS = [
     "gauhati university", "cotton university", "dibrugarh university", "nehu",
     "north-eastern hill university", "niser", "nit agartala", "manipur university",
     "mizoram university", "nagaland university", "tripura university", "rajiv gandhi university",
-    "sikkim university"
+    "sikkim university", "arunachal university"
 ]
 
 ASSAM_TERMS = [
@@ -112,7 +114,6 @@ def word_count(text: str) -> int:
 
 
 def clean_json_response(raw_resp: str) -> Dict[str, Any]:
-    """Strip markdown wrappers and safely parse JSON."""
     clean = re.sub(r"^```(?:json)?\s*", "", raw_resp.strip(), flags=re.MULTILINE)
     clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE).strip()
     try:
@@ -125,21 +126,41 @@ def clean_json_response(raw_resp: str) -> Dict[str, Any]:
 
 
 # ============================================================
-# DETERMINISTIC PRE-AUDIT & ASSET EXTRACTION
+# DETERMINISTIC MRJ TEMPLATE PRE-SCANNER
 # ============================================================
 
-def preaudit_sections_and_thesis_headers(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Scan document text hierarchy with Heading/Abstract flexibility and thesis subheadings pre-check."""
+def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
+    """
+    Examines text strictly against the Multidisciplinary Research Journal (MRJ) template:
+    - Abstract word count (target <= 200 words) and implicit header handling
+    - Multidisciplinary domains statement with at least (a) and (b)
+    - Declaration on AI Usage statement
+    - Thesis-style subheadings detection
+    """
     lines = text.splitlines()
     detected_map = {}
     detected_thesis_headers = []
+    template_observations = {
+        "abstract_word_count": 0,
+        "keywords_detected": [],
+        "multidisciplinary_domains_found": False,
+        "multidisciplinary_domains_count": 0,
+        "declaration_ai_usage_found": False,
+        "funding_statement_found": False,
+        "conflicts_statement_found": False,
+        "square_bracket_citations_found": False,
+    }
+
+    # Citation style check: [1], [1-3], [1,3]
+    citation_matches = re.findall(r"\[\d+(?:[\–\-–,]\s*\d+)*\]", text)
+    template_observations["square_bracket_citations_found"] = len(citation_matches) > 0
 
     for i, line in enumerate(lines):
         clean = normalize(line)
         if not clean or len(clean) > 85:
             continue
 
-        # Check standard sections
+        # Detect sections
         for sec_name, pattern in SECTION_PATTERNS.items():
             if sec_name in detected_map:
                 continue
@@ -161,7 +182,7 @@ def preaudit_sections_and_thesis_headers(text: str) -> Tuple[List[Dict[str, Any]
             if re.match(t_pattern, clean) and clean not in detected_thesis_headers:
                 detected_thesis_headers.append(clean)
 
-    # Abstract Flexibility Rule
+    # Abstract Flexibility Rule: scan front matter if unlabelled
     if "Abstract" not in detected_map:
         intro_line = detected_map.get("Introduction", {}).get("line_num", len(lines))
         search_limit = min(len(lines), intro_line, 40)
@@ -177,8 +198,41 @@ def preaudit_sections_and_thesis_headers(text: str) -> Tuple[List[Dict[str, Any]
                     "first_line_quote": l[:140],
                     "line_num": idx,
                 }
+                template_observations["abstract_word_count"] = word_count(l)
                 break
+    else:
+        # Extract abstract text to count words
+        abs_line = detected_map["Abstract"]["line_num"]
+        abs_text_parts = []
+        for nxt in lines[abs_line + 1: abs_line + 15]:
+            if re.match(r"(?i)^\s*(?:keywords?|1\.?\s+introduction)\b", nxt.strip()):
+                break
+            abs_text_parts.append(nxt)
+        template_observations["abstract_word_count"] = word_count(" ".join(abs_text_parts))
 
+    # Extract Keywords from text
+    m_kw = re.search(r"(?is)\bkeywords?\s*:\s*(.*?)(?=\n\s*(?:(?:1\.?\s+)?introduction|materials|abstract)\b|$)", text)
+    if m_kw:
+        raw_kw = m_kw.group(1).strip().splitlines()[0]
+        template_observations["keywords_detected"] = [
+            normalize(k) for k in re.split(r"[;,]", raw_kw) if len(normalize(k)) > 1
+        ]
+
+    # Verify MRJ Multidisciplinary Domains: "This research covers the domains: (a) XXX, (b) YYY"
+    m_dom = re.search(
+        r"(?is)\bmultidisciplinary\s+domains?\b.*?(?:this\s+research\s+covers\s+the\s+domains\s*:\s*|\(a\))(.*?)(?=\n\s*(?:funding|acknowledg|conflicts|declaration|references)\b|$)",
+        text,
+    )
+    if m_dom:
+        template_observations["multidisciplinary_domains_found"] = True
+        domain_items = re.findall(r"\([a-z]\)\s*([^,;.]+)", m_dom.group(0), flags=re.I)
+        template_observations["multidisciplinary_domains_count"] = len(domain_items)
+
+    # Verify MRJ AI Declaration
+    if re.search(r"(?is)\bdeclaration\s+on\s+ai\s+usage\b|prepared\s+without\s+the\s+use\s+of\s+ai\s+tools|ai\s+tools\b", text):
+        template_observations["declaration_ai_usage_found"] = True
+
+    # Assemble section list
     preaudited = []
     for sec in REQUIRED_TEMPLATE_SECTIONS:
         if sec in detected_map:
@@ -197,14 +251,11 @@ def preaudit_sections_and_thesis_headers(text: str) -> Tuple[List[Dict[str, Any]
                 "status_hint": "FAIL" if sec in CORE_SECTIONS else "WARN",
             })
 
-    return preaudited, detected_thesis_headers
+    return preaudited, detected_thesis_headers, template_observations
 
 
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
-    """
-    Extract document text and deduplicate formal captions.
-    Ignores informal narrative mentions (e.g., 'as shown in Figure 2').
-    """
+    """Extract full manuscript text while deduplicating formal captions."""
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
     asset_meta = {
@@ -278,7 +329,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 
 
 # ============================================================
-# AUDIT JSON SCHEMA SPECIFICATION (MATCHES PROMPT)
+# AUDIT JSON SCHEMA SPECIFICATION
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
@@ -409,35 +460,41 @@ AUDIT_STRICT_SCHEMA = {
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute pre-screening audit enforcing template compliance, thesis detection, and methodology audit."""
-    preaudited, detected_thesis = preaudit_sections_and_thesis_headers(raw_text)
+    """Execute pre-screening audit strictly matched against the MRJ template."""
+    preaudited, detected_thesis, template_obs = preaudit_mrj_template(raw_text)
 
-    prompt = f"""You are an expert scientific manuscript editorial auditor conducting a comprehensive pre-screening audit. Evaluate both structural completeness AND academic editorial quality prior to human peer review.
+    prompt = f"""You are an expert scientific manuscript editorial auditor pre-screening submissions for the Multidisciplinary Research Journal (MRJ).
 
-CRITICAL AUDIT INSTRUCTIONS:
+CRITICAL AUDIT INSTRUCTIONS & MRJ TEMPLATE RULES:
 
-1. TEMPLATE FORMAT & JOURNAL STRUCTURAL COMPLIANCE:
-   - Audit whether the manuscript follows standard journal article formatting vs. an unadapted thesis/dissertation structure.
-   - Flag redundant or unintegrated subheadings (e.g., separate subheadings for "Review of Literature", "Hypotheses", "Research Questions", "Statement of Problem", or "Delimitations"). State if these should be integrated directly into Introduction or Methods.
-   - Check Abstract quality: verify if statistical findings (e.g., p-values, effect sizes, sample sizes) are explicitly reported or if the abstract relies on generic claims.
+1. MRJ TEMPLATE FORMAT & JOURNAL STRUCTURAL COMPLIANCE:
+   - Audit whether the manuscript adheres to the MRJ template layout (Title, Abstract <=200w, 3-10 keywords separated by semicolons, 1. Introduction, 2. Materials and Methods, 3. Results and Discussion, 4. Conclusions, Multidisciplinary Domains, Funding, Acknowledgments, Conflicts of Interest, Declaration on AI Usage, References).
+   - Flag redundant or unintegrated thesis subheadings (e.g., separate subheadings for "Review of Literature", "Hypotheses", "Research Questions", "Statement of Problem", or "Delimitations"). State that these should be integrated directly into Introduction or Methods.
+   - Multidisciplinary Domains Requirement: Article MUST contain the exact statement: "This research covers the domains: (a) XXX, (b) YYY..." covering AT LEAST TWO domains.
+   - Declaration on AI Usage: Verify presence of declaration ("The authors declare that the article has been prepared without the use of AI tools" or declared AI usage).
+   - Check Abstract Quality: Verify if statistical/quantitative findings are reported or if the abstract relies on generic qualitative claims. Target length: single paragraph of ~200 words maximum.
 
 2. VERDICT CALIBRATION & ACTIONABLE RATIONALE:
-   - "Accept with Minor Revisions": All core empirical sections are intact; requires minor formatting, statement additions, or software version updates.
-   - "Major Revisions": Core sections present, but literature review is purely descriptive, theoretical framework is missing, or subheadings violate standard journal layout.
+   - "Accept as is": Meets all MRJ template requirements and scientific criteria.
+   - "Accept with Minor Revisions": All core empirical sections intact; requires minor formatting adjustments (e.g., adding MRJ domain statement, AI declaration, or software version numbers).
+   - "Major Revisions": Core sections present, but literature review is purely descriptive, theoretical framework is missing, or subheadings violate standard journal layout (e.g., unadapted dissertation).
    - For EVERY decision, provide an explicit, itemized array in "verdict_rationale" listing actionable steps for the author.
 
 3. EXCERPT & HEADING SAFETY:
-   - Assign "PASS" if text body is present, even if a heading is implicit or unformatted.
+   - Assign "PASS" if text body is present, even if a heading is implicit or unformatted (Abstract & Heading Flexibility Rule).
    - Assign "NOT EVALUATED (EXCERPT PROVIDED)" ONLY if document truncation prevents full reading.
 
 4. METHODOLOGICAL & SCIENTOMETRIC AUDIT:
-   - Audit for explicit theoretical frameworks, software versions (e.g., SPSS v28, VOSviewer v1.6.19), sample size justifications, and ethical approval statements.
+   - Audit for explicit theoretical frameworks, software versions (e.g., VOSviewer, Biblioshiny, SPSS), sample size justifications, and ethical approval statements.
 
-PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT:
-{json.dumps(preaudited, indent=2)}
-
-POTENTIAL THESIS/DISSERTATION SUBHEADINGS DETECTED BY REGEX:
-{json.dumps(detected_thesis, indent=2)}
+PRE-SCANNED MRJ TEMPLATE OBSERVATIONS:
+- Pre-scanned Sections Evidence: {json.dumps(preaudited, indent=2)}
+- Thesis Subheadings Detected by Regex: {json.dumps(detected_thesis, indent=2)}
+- Abstract Word Count: ~{template_obs['abstract_word_count']} words
+- Extracted Keywords ({len(template_obs['keywords_detected'])} found): {', '.join(template_obs['keywords_detected']) if template_obs['keywords_detected'] else 'None'}
+- Multidisciplinary Domains Statement Found: {template_obs['multidisciplinary_domains_found']} (Domains count: {template_obs['multidisciplinary_domains_count']})
+- Declaration on AI Usage Found: {template_obs['declaration_ai_usage_found']}
+- Square Bracket Citations [1] Detected: {template_obs['square_bracket_citations_found']}
 
 PRE-SCANNED FORMAL VISUAL CAPTIONS:
 {json.dumps(asset_meta['detected_captions'], indent=2)}
@@ -499,14 +556,14 @@ Return strictly valid, unformatted JSON following the exact schema."""
 
 
 # ============================================================
-# REVIEWER DISCOVERY (OPENALEX)
+# KEYWORD-BASED & RELEVANT REVIEWER DISCOVERY (OPENALEX)
 # ============================================================
 
 def openalex_get(url: str, params: Dict[str, Any], mailto: str = "") -> Dict[str, Any]:
     if mailto:
         params = dict(params)
         params["mailto"] = mailto
-    res = requests.get(url, params=params, timeout=30)
+    res = requests.get(url, params=params, timeout=25)
     res.raise_for_status()
     return res.json()
 
@@ -528,18 +585,20 @@ def candidate_region_match(candidate: Dict[str, Any], region: str) -> bool:
     return False
 
 
-def search_openalex_reviewers(query_terms: List[str], region: str, mailto: str = "", max_candidates: int = 5) -> List[Dict[str, Any]]:
-    query = " ".join(query_terms[:4]).strip()
-    if not query:
+def search_openalex_by_query(query: str, region: str, matched_topic: str, mailto: str = "") -> List[Dict[str, Any]]:
+    """Query OpenAlex for authors publishing on a query term within a specific regional affiliation."""
+    if not query.strip():
+        return []
+    try:
+        data = openalex_get(
+            OPENALEX_URL,
+            {"search": query, "per-page": 30, "sort": "publication_year:desc"},
+            mailto=mailto,
+        )
+    except Exception:
         return []
 
-    data = openalex_get(
-        OPENALEX_URL,
-        {"search": query, "per-page": 30, "sort": "publication_year:desc"},
-        mailto=mailto,
-    )
-
-    candidates: Dict[str, Dict[str, Any]] = {}
+    candidates = {}
     for work in data.get("results", []):
         year = work.get("publication_year") or 0
         title = work.get("display_name") or ""
@@ -561,6 +620,7 @@ def search_openalex_reviewers(query_terms: List[str], region: str, mailto: str =
                     "country": inst.get("country_code") or "",
                     "city": (inst.get("geo") or {}).get("city") or "",
                     "region": (inst.get("geo") or {}).get("region") or "",
+                    "match_type": f"Relevant Discipline Specialist (via '{matched_topic}')",
                     "recent_pubs": [],
                 }
                 if not candidate_region_match(candidate, region):
@@ -570,20 +630,69 @@ def search_openalex_reviewers(query_terms: List[str], region: str, mailto: str =
                     candidates[author_id] = candidate
                 candidates[author_id]["recent_pubs"].append({"year": year, "title": title, "doi": doi})
 
-    results = list(candidates.values())
-    results.sort(key=lambda x: len(x["recent_pubs"]), reverse=True)
-    return results[:max_candidates]
+    return list(candidates.values())
 
 
-def reviewer_discovery_report(title: str, mailto: str = "") -> Dict[str, List[Dict[str, Any]]]:
-    stopwords = {"a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "of", "by", "from", "using", "study", "analysis"}
-    terms = [w for w in re.findall(r"\b[A-Za-z]{3,}\b", title) if w.lower() not in stopwords]
+def reviewer_discovery_report(
+    title: str,
+    extracted_keywords: List[str],
+    mailto: str = "",
+    max_per_region: int = 5,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Multi-stage reviewer search:
+    1. Direct title search.
+    2. Fallback to pertinent keywords from manuscript (so relevant reviewers are ALWAYS found).
+    3. Fallback to broad institutional domains in Assam / Northeast India / India.
+    """
+    stopwords = {"a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "of", "by", "from", "using", "study", "analysis", "approach", "based"}
+    title_terms = [w for w in re.findall(r"\b[A-Za-z]{3,}\b", title) if w.lower() not in stopwords]
+
+    # Priority queries list
+    search_queries = []
+    # 1. Exact title key-phrase
+    if title_terms:
+        search_queries.append((" ".join(title_terms[:3]), "Manuscript Title Phrase"))
+    # 2. Extracted manuscript keywords
+    for kw in extracted_keywords[:4]:
+        if kw and len(kw) > 2:
+            search_queries.append((kw, kw))
+    # 3. Individual title terms
+    for term in title_terms[:3]:
+        if term not in [sq[0] for sq in search_queries]:
+            search_queries.append((term, term))
+
     output = {}
-    for r in ["India", "Northeast India", "Assam"]:
-        try:
-            output[r] = search_openalex_reviewers(terms, r, mailto=mailto)
-        except Exception as exc:
-            output[r] = [{"error": f"OpenAlex query failed: {exc}"}]
+    for region in ["India", "Northeast India", "Assam"]:
+        region_candidates = {}
+
+        # Progressively query until max_per_region candidates are gathered
+        for q_str, q_label in search_queries:
+            if len(region_candidates) >= max_per_region:
+                break
+            found = search_openalex_by_query(q_str, region, matched_topic=q_label, mailto=mailto)
+            for cand in found:
+                aid = cand["author_id"]
+                if aid not in region_candidates:
+                    region_candidates[aid] = cand
+                else:
+                    region_candidates[aid]["recent_pubs"].extend(cand["recent_pubs"])
+
+        results = list(region_candidates.values())
+        results.sort(key=lambda x: len(x["recent_pubs"]), reverse=True)
+
+        # Fallback if specific regional query returned fewer than 2 candidates
+        if len(results) < 2 and region in ["Assam", "Northeast India"]:
+            # Query premier regional university hubs with general domain keyword
+            fallback_kw = extracted_keywords[0] if extracted_keywords else (title_terms[0] if title_terms else "research")
+            hub_query = f"IIT Guwahati {fallback_kw}" if region == "Assam" else f"Tezpur University {fallback_kw}"
+            hub_found = search_openalex_by_query(hub_query, region, matched_topic=f"Regional Hub ({fallback_kw})", mailto=mailto)
+            for c in hub_found:
+                if c["author_id"] not in region_candidates:
+                    results.append(c)
+
+        output[region] = results[:max_per_region]
+
     return output
 
 
@@ -631,9 +740,13 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 # REPORT BUILDER (.DOCX)
 # ============================================================
 
-def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[str, Any]]]) -> bytes:
+def generate_docx_report(
+    audit: Dict[str, Any],
+    reviewers: Dict[str, List[Dict[str, Any]]],
+    template_obs: Dict[str, Any],
+) -> bytes:
     doc = Document()
-    doc.add_heading("Academic Pre-Screening & Editorial Audit Report", 0)
+    doc.add_heading("MRJ Academic Pre-Screening & Editorial Audit Report", 0)
     doc.add_paragraph(f"Manuscript Title: {audit.get('manuscript_title', 'Not specified')}")
 
     verd = audit.get("editorial_verdict", {})
@@ -646,16 +759,21 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
         for r_item in rationale_list:
             doc.add_paragraph(f"• {r_item}")
 
-    # Template Format Audit Section
-    doc.add_heading("1. Template Format & Journal Structural Compliance", level=1)
+    # MRJ Template Compliance Section
+    doc.add_heading("1. MRJ Template Format & Structural Compliance", level=1)
     tf = audit.get("template_format_audit", {})
     doc.add_paragraph(f"Journal Style Compliance: {tf.get('journal_style_compliance', 'N/A')}")
+    doc.add_paragraph(f"Multidisciplinary Domains Statement: {'Detected (>=2 domains)' if template_obs.get('multidisciplinary_domains_count', 0) >= 2 else 'Missing or Incomplete (<2 domains)'}")
+    doc.add_paragraph(f"Declaration on AI Usage Statement: {'Detected' if template_obs.get('declaration_ai_usage_found') else 'Missing'}")
+    doc.add_paragraph(f"Square-bracket Citations [1]: {'Detected' if template_obs.get('square_bracket_citations_found') else 'Missing or Inconsistent'}")
+
     thesis_headers = tf.get("unwanted_thesis_subheadings_detected", [])
     if thesis_headers:
         doc.add_paragraph("Unwanted Thesis Subheadings Identified: " + ", ".join(thesis_headers))
     else:
         doc.add_paragraph("Unwanted Thesis Subheadings: None detected (Standard journal layout).")
     doc.add_paragraph(f"Abstract Quality Assessment: {tf.get('abstract_quality_check', 'N/A')}")
+
     instructions = tf.get("template_correction_instructions", [])
     if instructions:
         doc.add_paragraph("Structural Layout Instructions:")
@@ -698,12 +816,15 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
     doc.add_paragraph(f"Software Reproducibility Notes: {meth.get('software_reproducibility_notes', '')}")
 
     # Reviewer Candidates
-    doc.add_heading("5. Verified Reviewer Discovery (OpenAlex)", level=1)
+    doc.add_heading("5. Verified Relevant Reviewer Discovery (OpenAlex)", level=1)
     for reg, cands in reviewers.items():
         doc.add_heading(reg, level=2)
+        if not cands:
+            doc.add_paragraph("No candidate profiles returned.")
+            continue
         for c in cands:
             if "name" in c:
-                doc.add_paragraph(f"- {c['name']} ({c.get('institution', 'N/A')}): {len(c.get('recent_pubs', []))} verified publications")
+                doc.add_paragraph(f"- {c['name']} ({c.get('institution', 'N/A')}): [{c.get('match_type', 'Relevant Specialist')}] - {len(c.get('recent_pubs', []))} recent publications")
 
     out = io.BytesIO()
     doc.save(out)
@@ -714,53 +835,59 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
 # STREAMLIT UI (STRUCTURED DASHBOARD - NO RAW JSON DUMP)
 # ============================================================
 
-st.set_page_config(page_title="Academic Manuscript Editorial Auditor", page_icon="🎓", layout="wide")
-st.title("🎓 Academic Pre-Screening & Editorial Auditor")
-st.caption("Structural completeness, thesis format adaptation checks, scientometrics, and reviewer discovery.")
+st.set_page_config(page_title="MRJ Manuscript Editorial Auditor", page_icon="📄", layout="wide")
+st.title("📄 MRJ Manuscript Pre-Screening & Editorial Auditor")
+st.caption("Automated audit against Multidisciplinary Research Journal (MRJ) specifications and keyword-based regional reviewer discovery.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     groq_api_key = st.text_input("Groq API Key", value=get_secret("GROQ_API_KEY"), type="password")
-    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editorial-auditor@mrjournal.org"))
+    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editor@mrjournal.org"))
     st.markdown("---")
-    st.markdown("**Critical Pre-Screening Directives:**")
-    st.markdown("1. **Thesis Subheading Check**: Flags unadapted dissertation headers (e.g., 'Review of Related Literature', 'Hypotheses').")
-    st.markdown("2. **Abstract Quality**: Audits quantitative findings (p-values, effect sizes) vs generic claims.")
-    st.markdown("3. **Theoretical Rigor**: Checks explicit theoretical framework presence.")
-    st.markdown("4. **Actionable Verdict Rationale**: Explicit revision requirements for authors.")
+    st.markdown("**MRJ Template Checkpoints:**")
+    st.markdown("1. **Multidisciplinary Domains**: Mandatory `(a)` & `(b)` statements.")
+    st.markdown("2. **Declaration on AI Usage**: Mandatory compliance statement.")
+    st.markdown("3. **Abstract & Keywords**: $\le 200$ words, 3–10 semicolon-separated keywords.")
+    st.markdown("4. **Thesis Architecture**: Identifies unintegrated dissertation headers.")
+    st.markdown("5. **Relevant Reviewers**: Discovers domain experts in Assam, Northeast India, & India.")
 
 uploaded_file = st.file_uploader("Upload Manuscript (.pdf or .docx)", type=["pdf", "docx"])
 
-if uploaded_file and st.button("🚀 Conduct Comprehensive Editorial Audit", type="primary"):
+if uploaded_file and st.button("🚀 Run MRJ Editorial Pre-Screening Audit", type="primary"):
     if not groq_api_key:
         st.error("Please provide a valid Groq API Key.")
         st.stop()
 
     try:
-        with st.spinner("Extracting document hierarchy, checking thesis markers, and auditing assets..."):
+        with st.spinner("Extracting text and scanning MRJ template layout..."):
             raw_text, asset_meta = extract_text_and_assets(uploaded_file)
             if not raw_text.strip():
                 st.error("Could not extract readable text from the uploaded document.")
                 st.stop()
 
+        with st.spinner("Pre-auditing sections, AI declaration, and thesis markers..."):
+            _, _, template_obs = preaudit_mrj_template(raw_text)
+
         with st.spinner("Executing rigorous editorial & methodology audit with Groq AI..."):
             client = Groq(api_key=groq_api_key)
             audit_result = run_editorial_audit(raw_text, asset_meta, client)
 
-        with st.spinner("Querying OpenAlex for verified regional peer reviewers..."):
+        with st.spinner("Discovering relevant regional peer reviewers via keywords & domain matching..."):
             detected_title = audit_result.get("manuscript_title", "")
-            reviewers = reviewer_discovery_report(detected_title, mailto=openalex_mailto)
+            keywords_for_search = template_obs.get("keywords_detected", [])
+            reviewers = reviewer_discovery_report(detected_title, keywords_for_search, mailto=openalex_mailto)
 
         with st.spinner("Compiling DOCX editorial report and blind reviewer copy..."):
             orig_bytes = uploaded_file.getvalue()
             blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
-            docx_report = generate_docx_report(audit_result, reviewers)
+            docx_report = generate_docx_report(audit_result, reviewers, template_obs)
 
         st.session_state["audit"] = audit_result
         st.session_state["reviewers"] = reviewers
+        st.session_state["template_obs"] = template_obs
         st.session_state["blind_bytes"] = blind_bytes
         st.session_state["docx_report"] = docx_report
-        st.success("Comprehensive pre-screening audit complete.")
+        st.success("MRJ pre-screening audit complete.")
 
     except Exception as e:
         st.error(f"Audit processing error: {e}")
@@ -769,6 +896,7 @@ if uploaded_file and st.button("🚀 Conduct Comprehensive Editorial Audit", typ
 if "audit" in st.session_state:
     audit = st.session_state["audit"]
     reviewers = st.session_state["reviewers"]
+    template_obs = st.session_state["template_obs"]
     verd = audit.get("editorial_verdict", {})
     decision = verd.get("decision", "Under Review")
 
@@ -793,20 +921,25 @@ if "audit" in st.session_state:
                 st.markdown(f"- ⚠️ {r_item}")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏛️ Template & Thesis Audit",
+        "🏛️ MRJ Template & Thesis Audit",
         "📋 Section Verification",
         "🖼️ Visual Asset Audit",
         "🔬 Methodology & Theory Logic",
-        "👥 Verified Reviewer Candidates",
+        "👥 Relevant Reviewer Discovery",
     ])
 
     # Tab 1: Template Format & Thesis Compliance
     with tab1:
-        st.subheader("Template Format & Journal Compliance Audit")
+        st.subheader("MRJ Template Compliance & Dissertation Adaptation")
         tf = audit.get("template_format_audit", {})
         comp_status = tf.get("journal_style_compliance", "N/A")
         badge = "🟢 PASS (Standard Journal Layout)" if comp_status == "PASS" else ("🟡 WARN (Thesis Artifacts Present)" if comp_status == "WARN" else "🔴 FAIL (Unadapted Dissertation)")
-        st.metric("Journal Style Compliance", badge)
+        
+        m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+        m_c1.metric("Journal Style Compliance", badge)
+        m_c2.metric("Multidisciplinary Domains", f"{template_obs.get('multidisciplinary_domains_count', 0)} detected (min. 2)")
+        m_c3.metric("Declaration on AI Usage", "✅ Present" if template_obs.get("declaration_ai_usage_found") else "❌ Missing")
+        m_c4.metric("Abstract Word Count", f"~{template_obs.get('abstract_word_count', 0)} words (limit 200)")
 
         unwanted = tf.get("unwanted_thesis_subheadings_detected", [])
         if unwanted:
@@ -873,14 +1006,17 @@ if "audit" in st.session_state:
             mc3.write("✅ None identified as missing.")
         st.info(f"**Software Reproducibility & Parameter Notes:**\n\n{meth.get('software_reproducibility_notes', 'None recorded.')}")
 
-    # Tab 5: OpenAlex Reviewers
+    # Tab 5: Relevant Reviewer Discovery
     with tab5:
-        st.subheader("OpenAlex Verified Peer Reviewer Discovery")
-        st.caption("Matched against candidate profiles in verified regional institutions.")
+        st.subheader("Relevant Peer Reviewer Discovery (Keyword-Matched)")
+        st.caption(
+            "Reviewers are retrieved from OpenAlex. When exact-title publications are rare, candidates are "
+            "matched via the manuscript's extracted research keywords and subject domains to ensure relevant experts are always provided."
+        )
         for region, cands in reviewers.items():
             st.markdown(f"### Region: {region}")
-            if not cands or "error" in cands[0]:
-                st.write("No matching candidate profiles found.")
+            if not cands:
+                st.write("No matching candidate profiles returned for this region.")
                 continue
             r_rows = []
             for c in cands:
@@ -889,6 +1025,7 @@ if "audit" in st.session_state:
                 r_rows.append({
                     "Candidate Name": c.get("name"),
                     "Institution": c.get("institution"),
+                    "Expertise Match Type": c.get("match_type", "Domain Specialist"),
                     "Verified Works": len(pubs),
                     "Recent Representative Publication": latest_title,
                 })
@@ -901,7 +1038,7 @@ if "audit" in st.session_state:
     d1.download_button(
         "📄 Download Editorial Report (.docx)",
         data=st.session_state["docx_report"],
-        file_name="Editorial_Audit_Report.docx",
+        file_name="MRJ_Editorial_Audit_Report.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         use_container_width=True,
     )
@@ -909,14 +1046,14 @@ if "audit" in st.session_state:
         d2.download_button(
             "🙈 Download Anonymized Blind Copy (.docx)",
             data=st.session_state["blind_bytes"],
-            file_name="Anonymized_Reviewer_Copy.docx",
+            file_name="MRJ_Anonymized_Reviewer_Copy.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
         )
     d3.download_button(
         "💾 Download Audit Data (.json)",
         data=json.dumps(audit, indent=2),
-        file_name="audit_data.json",
+        file_name="mrj_audit_data.json",
         mime="application/json",
         use_container_width=True,
     )
