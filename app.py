@@ -102,7 +102,7 @@ def word_count(text: str) -> int:
 
 
 def clean_json_response(raw_resp: str) -> Dict[str, Any]:
-    """Strip markdown wrappers and parse valid JSON."""
+    """Strip markdown wrappers and parse strictly valid JSON."""
     clean = re.sub(r"^```(?:json)?\s*", "", raw_resp.strip(), flags=re.MULTILINE)
     clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE).strip()
     try:
@@ -115,11 +115,15 @@ def clean_json_response(raw_resp: str) -> Dict[str, Any]:
 
 
 # ============================================================
-# DETERMINISTIC PRE-AUDIT & ASSET EXTRACTION
+# DETERMINISTIC PRE-AUDIT WITH HEADING & ABSTRACT FLEXIBILITY
 # ============================================================
 
 def preaudit_sections(text: str) -> List[Dict[str, Any]]:
-    """Scan entire document text hierarchy to locate exact headings and first-line quotes."""
+    """
+    Scans the document text hierarchy.
+    Applies the Heading Flexibility Rule: if a section's text body/quote is detected
+    (e.g., an unlabelled abstract block in front matter), it is captured as PASS.
+    """
     lines = text.splitlines()
     detected_map = {}
 
@@ -139,9 +143,30 @@ def preaudit_sections(text: str) -> List[Dict[str, Any]]:
                         break
                 detected_map[sec_name] = {
                     "heading": clean,
-                    "first_line_quote": quote or "Heading located with direct follow-up text.",
+                    "first_line_quote": quote or "Section heading identified with inline content.",
                     "line_num": i,
                 }
+
+    # ABSTRACT FLEXIBILITY CHECK:
+    # If "Abstract" was not explicitly found via heading regex, scan front matter for the abstract body paragraph.
+    if "Abstract" not in detected_map:
+        intro_line = detected_map.get("Introduction", {}).get("line_num", len(lines))
+        # Look in the region between line 1 and Introduction (or top 35 lines)
+        search_limit = min(len(lines), intro_line, 40)
+        for idx in range(search_limit):
+            l = lines[idx].strip()
+            # If line is a substantial paragraph and not metadata (emails, affiliations, DOIs)
+            if (
+                len(l.split()) >= 25
+                and not re.search(r"(?i)@|department\b|university\b|institute\b|received:|accepted:|doi\.org|issn|vol\.\s*\d+", l)
+                and not any(re.match(p, l) for p in SECTION_PATTERNS.values())
+            ):
+                detected_map["Abstract"] = {
+                    "heading": "Implicit Abstract (Heading unformatted/omitted)",
+                    "first_line_quote": l[:140],
+                    "line_num": idx,
+                }
+                break
 
     preaudited = []
     for sec in REQUIRED_TEMPLATE_SECTIONS:
@@ -166,7 +191,7 @@ def preaudit_sections(text: str) -> List[Dict[str, Any]]:
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     """
     Extract full manuscript text while auditing formal visual captions.
-    Deduplicates and ignores narrative in-text references (e.g., 'as shown in Figure 2').
+    Deduplicates and ignores narrative in-text mentions (e.g., 'as shown in Figure 2').
     """
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
@@ -331,37 +356,42 @@ AUDIT_STRICT_SCHEMA = {
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute rigorous pre-screening audit enforcing all critical instructions."""
+    """Execute rigorous pre-screening audit enforcing heading flexibility and evidence verification."""
     preaudited = preaudit_sections(raw_text)
 
     prompt = f"""You are an expert scientific manuscript editorial auditor. Conduct a thorough, evidence-based pre-screening audit of the provided manuscript.
 
 CRITICAL INSTRUCTIONS & CONSTRAINTS:
 
-1. ABSENCE VERIFICATION & EXCERPT HANDLING:
+1. ABSTRACT & HEADING FLEXIBILITY RULE:
+   - If a section's text body or first-line quote is detected (e.g., the abstract paragraph at the start of the paper), mark its status as "PASS", even if the explicit section heading word (e.g., "ABSTRACT") is absent or unformatted.
+   - In "detected_heading", report "Implicit / Body Detected" or the specific format found if the explicit heading label was missing.
+   - Assign "FAIL" ONLY if both the heading AND the body text/quote are completely absent from a full manuscript.
+
+2. ABSENCE VERIFICATION & EXCERPT HANDLING:
    - Do NOT mark a section as "NOT EVALUATED (EXCERPT PROVIDED)" if the text or heading is present in the document.
    - Scan the ENTIRE document text hierarchy from top to bottom before assigning a section status.
-   - Assign "PASS" if the section heading AND its corresponding body text/quotes are found.
+   - Assign "PASS" if the section heading OR its corresponding body text/quotes are found.
    - Assign "NOT EVALUATED (EXCERPT PROVIDED)" ONLY if the manuscript file is demonstrably cut off mid-text and no body text was provided for that section.
-   - Assign "FAIL" ONLY if the manuscript is completely provided and a required core section is missing entirely.
+   - Assign "FAIL" ONLY if both the heading AND the body text/quote are completely absent from a full manuscript.
    - Assign "WARN" for missing optional sections (e.g., Acknowledgments, Funding, Ethics Statement, AI Usage).
 
-2. EVIDENCE-BASED AUDITING:
+3. EVIDENCE-BASED AUDITING:
    - For EVERY section evaluated, you MUST extract and provide an exact first-line text quote from the manuscript as proof of existence. Do NOT leave quotes blank if the section text exists.
 
-3. MANUSCRIPT TITLE RESOLUTION:
+4. MANUSCRIPT TITLE RESOLUTION:
    - Extract the full, actual academic article title (e.g., "Consumer Perception, Food Waste and Food Packaging Research...").
    - NEVER output a DOI link, URL string, header metadata, or journal name as the manuscript title.
 
-4. VISUAL ASSET & CAPTION AUDIT:
+5. VISUAL ASSET & CAPTION AUDIT:
    - Audit formal table and figure captions (e.g., "Table 1: ...", "Figure 2: ...").
    - Deduplicate narrative text mentions: Do NOT create separate entries for in-text sentence mentions (e.g., ignore sentences like "as shown in Figure 2").
 
-5. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
+6. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
    - For bibliometric/scientometric studies, explicitly audit and report whether standard domain metrics are present: h-index, g-index, m-index.
    - Audit software reproducibility: check if version numbers, parameter settings, or normalization techniques (e.g., VOSviewer, Biblioshiny, CiteSpace) are explicitly detailed.
 
-PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT:
+PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT (INCLUDING IMPLICIT BODY PARAGRAPHS):
 {json.dumps(preaudited, indent=2)}
 
 PRE-SCANNED FORMAL VISUAL CAPTIONS:
@@ -377,7 +407,7 @@ Return strictly valid, unformatted JSON following the exact schema."""
     messages = [
         {
             "role": "system",
-            "content": "You are an expert scientific manuscript editorial auditor. Audit thoroughly with zero hallucinations. Output strictly valid JSON matching the schema.",
+            "content": "You are an expert scientific manuscript editorial auditor. Output strictly valid JSON matching the requested schema.",
         },
         {"role": "user", "content": prompt},
     ]
@@ -622,7 +652,7 @@ with st.sidebar:
     openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editorial-auditor@mrjournal.org"))
     st.markdown("---")
     st.markdown("**Critical Pre-Screening Directives:**")
-    st.markdown("1. **Absence Verification**: Scans full hierarchy; never marks `NOT EVALUATED` if text exists.")
+    st.markdown("1. **Abstract & Heading Flexibility**: Section passes if body text/quote is found, even if unlabelled.")
     st.markdown("2. **Evidence-Based Quotes**: Verifies first-line quotes for every section.")
     st.markdown("3. **Title Resolution**: Full article title; no DOIs/URLs.")
     st.markdown("4. **Asset Deduplication**: Audits formal captions only.")
