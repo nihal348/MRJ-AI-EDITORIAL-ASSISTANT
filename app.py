@@ -22,7 +22,6 @@ FALLBACK_MODEL = "llama-3.3-70b-versatile"
 OPENALEX_URL = "https://api.openalex.org/works"
 OPENALEX_AUTHOR_URL = "https://api.openalex.org/authors"
 
-# MRJ Template Required Sections (in order of template appearance)
 REQUIRED_TEMPLATE_SECTIONS = [
     "Abstract",
     "Introduction",
@@ -33,7 +32,7 @@ REQUIRED_TEMPLATE_SECTIONS = [
     "Funding",
     "Acknowledgments",
     "Conflicts of Interest",
-    "AI Usage",
+    "Declaration on AI Usage",
     "References",
     "Ethics Statement",
 ]
@@ -58,7 +57,7 @@ SECTION_PATTERNS = {
     "Funding": r"(?i)^\s*(?:funding(?:\s+information)?|financial\s+support|grant\s+support)\s*:?$",
     "Acknowledgments": r"(?i)^\s*(?:acknowledgments?|acknowledgements?)\s*:?$",
     "Conflicts of Interest": r"(?i)^\s*(?:conflicts?\s+of\s+interest|competing\s+interests?|disclosure\s+statement)\s*:?$",
-    "AI Usage": r"(?i)^\s*(?:declaration\s+on\s+ai(?:\s+usage)?|generative\s+ai\s+statement|ai\s+usage|declaration\s+on\s+artificial\s+intelligence)\s*:?$",
+    "Declaration on AI Usage": r"(?i)^\s*(?:declaration\s+on\s+ai(?:\s+usage)?|generative\s+ai\s+statement|ai\s+usage|declaration\s+on\s+artificial\s+intelligence)\s*:?$",
     "References": r"(?i)^\s*(?:references?|bibliography|literature\s+cited)\s*:?$",
     "Ethics Statement": r"(?i)^\s*(?:ethics\s+statement|ethical\s+approval|ethics\s+approval|institutional\s+review\s+board|irb\s+statement)\s*:?$",
 }
@@ -68,9 +67,19 @@ THESIS_SUBHEADING_PATTERNS = [
     r"(?i)\b(?:statement of (?:the )?problem|problem statement)\b",
     r"(?i)\b(?:hypotheses|hypothesis development)\b",
     r"(?i)\b(?:research questions?)\b",
+    r"(?i)\b(?:objectives of (?:the )?study)\b",
     r"(?i)\b(?:delimitations?|scope and delimitations?)\b",
     r"(?i)\b(?:significance of (?:the )?study)\b",
     r"(?i)\b(?:conceptual framework)\b",
+    r"(?i)\b(?:operational definitions?)\b",
+]
+
+TEMPLATE_PLACEHOLDER_PATTERNS = [
+    r"(?i)\b(?:issn\s*[:\-]?\s*xxxx-xxxx|issn\s+xxxx)\b",
+    r"(?i)\b(?:doi\s*[:\-]?\s*10\.xxxx[^\s]*)\b",
+    r"(?i)\b(?:volume\s*xx|vol\.\s*xx|issue\s*xx)\b",
+    r"(?i)\b(?:received\s*:\s*date|accepted\s*:\s*date|published\s*:\s*date)\b",
+    r"(?i)\[insert\s+(?:figure|table|author|text|affiliation)\b.*?\]",
 ]
 
 NORTHEAST_STATES = {
@@ -80,7 +89,7 @@ NORTHEAST_STATES = {
 NORTHEAST_INSTITUTION_TERMS = [
     "iit guwahati", "tezu university", "tezpur university", "nit silchar", "assam university",
     "gauhati university", "cotton university", "dibrugarh university", "nehu",
-    "north-eastern hill university", "niser", "nit agartala", "manipur university",
+    "north-eastern hill university", "nit agartala", "manipur university",
     "mizoram university", "nagaland university", "tripura university", "rajiv gandhi university",
     "sikkim university", "arunachal university"
 ]
@@ -122,24 +131,18 @@ def clean_json_response(raw_resp: str) -> Dict[str, Any]:
         match = re.search(r"(\{.*\})", clean, re.DOTALL)
         if match:
             return json.loads(match.group(1))
-        raise ValueError("Could not extract valid JSON from completion.")
+        raise ValueError("Could not extract valid JSON from LLM audit response.")
 
 
 # ============================================================
 # DETERMINISTIC MRJ TEMPLATE PRE-SCANNER
 # ============================================================
 
-def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
-    """
-    Examines text strictly against the Multidisciplinary Research Journal (MRJ) template:
-    - Abstract word count (target <= 200 words) and implicit header handling
-    - Multidisciplinary domains statement with at least (a) and (b)
-    - Declaration on AI Usage statement
-    - Thesis-style subheadings detection
-    """
+def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], List[str], Dict[str, Any]]:
     lines = text.splitlines()
     detected_map = {}
     detected_thesis_headers = []
+    detected_placeholders = []
     template_observations = {
         "abstract_word_count": 0,
         "keywords_detected": [],
@@ -149,11 +152,25 @@ def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], D
         "funding_statement_found": False,
         "conflicts_statement_found": False,
         "square_bracket_citations_found": False,
+        "improper_p_values_detected": [],
     }
 
-    # Citation style check: [1], [1-3], [1,3]
+    # Citations check
     citation_matches = re.findall(r"\[\d+(?:[\–\-–,]\s*\d+)*\]", text)
     template_observations["square_bracket_citations_found"] = len(citation_matches) > 0
+
+    # P-value regex scan (flagging p=0.00 or p=0)
+    p_zero_matches = re.findall(r"(?i)\bp\s*(?:=|is)\s*0(?:\.0+)?(?!\d)", text)
+    if p_zero_matches:
+        template_observations["improper_p_values_detected"] = list(set(p_zero_matches))
+
+    # Placeholder detection
+    for ph_pattern in TEMPLATE_PLACEHOLDER_PATTERNS:
+        matches = re.findall(ph_pattern, text)
+        for m in matches:
+            clean_m = normalize(m)
+            if clean_m and clean_m not in detected_placeholders:
+                detected_placeholders.append(clean_m)
 
     for i, line in enumerate(lines):
         clean = normalize(line)
@@ -177,15 +194,15 @@ def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], D
                     "line_num": i,
                 }
 
-        # Check for thesis/dissertation subheadings
+        # Check for thesis subheadings
         for t_pattern in THESIS_SUBHEADING_PATTERNS:
             if re.match(t_pattern, clean) and clean not in detected_thesis_headers:
                 detected_thesis_headers.append(clean)
 
-    # Abstract Flexibility Rule: scan front matter if unlabelled
+    # Implicit abstract detection
     if "Abstract" not in detected_map:
         intro_line = detected_map.get("Introduction", {}).get("line_num", len(lines))
-        search_limit = min(len(lines), intro_line, 40)
+        search_limit = min(len(lines), intro_line, 45)
         for idx in range(search_limit):
             l = lines[idx].strip()
             if (
@@ -201,16 +218,15 @@ def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], D
                 template_observations["abstract_word_count"] = word_count(l)
                 break
     else:
-        # Extract abstract text to count words
         abs_line = detected_map["Abstract"]["line_num"]
         abs_text_parts = []
-        for nxt in lines[abs_line + 1: abs_line + 15]:
+        for nxt in lines[abs_line + 1: abs_line + 18]:
             if re.match(r"(?i)^\s*(?:keywords?|1\.?\s+introduction)\b", nxt.strip()):
                 break
             abs_text_parts.append(nxt)
         template_observations["abstract_word_count"] = word_count(" ".join(abs_text_parts))
 
-    # Extract Keywords from text
+    # Keywords detection
     m_kw = re.search(r"(?is)\bkeywords?\s*:\s*(.*?)(?=\n\s*(?:(?:1\.?\s+)?introduction|materials|abstract)\b|$)", text)
     if m_kw:
         raw_kw = m_kw.group(1).strip().splitlines()[0]
@@ -218,7 +234,7 @@ def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], D
             normalize(k) for k in re.split(r"[;,]", raw_kw) if len(normalize(k)) > 1
         ]
 
-    # Verify MRJ Multidisciplinary Domains: "This research covers the domains: (a) XXX, (b) YYY"
+    # Multidisciplinary Domains verification
     m_dom = re.search(
         r"(?is)\bmultidisciplinary\s+domains?\b.*?(?:this\s+research\s+covers\s+the\s+domains\s*:\s*|\(a\))(.*?)(?=\n\s*(?:funding|acknowledg|conflicts|declaration|references)\b|$)",
         text,
@@ -228,11 +244,11 @@ def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], D
         domain_items = re.findall(r"\([a-z]\)\s*([^,;.]+)", m_dom.group(0), flags=re.I)
         template_observations["multidisciplinary_domains_count"] = len(domain_items)
 
-    # Verify MRJ AI Declaration
+    # AI Declaration check
     if re.search(r"(?is)\bdeclaration\s+on\s+ai\s+usage\b|prepared\s+without\s+the\s+use\s+of\s+ai\s+tools|ai\s+tools\b", text):
         template_observations["declaration_ai_usage_found"] = True
 
-    # Assemble section list
+    # Assemble section pre-audit
     preaudited = []
     for sec in REQUIRED_TEMPLATE_SECTIONS:
         if sec in detected_map:
@@ -251,11 +267,10 @@ def preaudit_mrj_template(text: str) -> Tuple[List[Dict[str, Any]], List[str], D
                 "status_hint": "FAIL" if sec in CORE_SECTIONS else "WARN",
             })
 
-    return preaudited, detected_thesis_headers, template_observations
+    return preaudited, detected_thesis_headers, detected_placeholders, template_observations
 
 
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
-    """Extract full manuscript text while deduplicating formal captions."""
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
     asset_meta = {
@@ -300,7 +315,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     if name.endswith(".pdf"):
         pages = []
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for page_idx, page in enumerate(pdf.pages):
+            for page in pdf.pages:
                 page_text = page.extract_text() or ""
                 pages.append(page_text)
 
@@ -329,7 +344,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 
 
 # ============================================================
-# AUDIT JSON SCHEMA SPECIFICATION
+# AUDIT JSON SCHEMA SPECIFICATION (5-PASS ENGINE)
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
@@ -351,93 +366,155 @@ AUDIT_STRICT_SCHEMA = {
                             "Reject",
                         ],
                     },
-                    "verdict_rationale": {
+                    "executive_summary": {"type": "string"},
+                    "actionable_revision_requirements": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "summary_notes": {"type": "string"},
                 },
-                "required": ["decision", "verdict_rationale", "summary_notes"],
+                "required": ["decision", "executive_summary", "actionable_revision_requirements"],
                 "additionalProperties": False,
             },
-            "template_format_audit": {
+            "pass_1_cross_section_integrity": {
+                "type": "object",
+                "properties": {
+                    "abstract_claimed_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "abstract_body_discrepancies": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["abstract_claimed_items", "abstract_body_discrepancies"],
+                "additionalProperties": False,
+            },
+            "pass_2_template_and_layout": {
                 "type": "object",
                 "properties": {
                     "journal_style_compliance": {
                         "type": "string",
-                        "enum": ["PASS", "WARN", "FAIL"],
+                        "enum": ["PASS", "FAIL"],
                     },
-                    "unwanted_thesis_subheadings_detected": {
+                    "unwanted_thesis_subheadings": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "abstract_quality_check": {"type": "string"},
-                    "template_correction_instructions": {
+                    "template_placeholders_detected": {
                         "type": "array",
                         "items": {"type": "string"},
+                    },
+                    "multidisciplinary_domains_compliance": {
+                        "type": "string",
+                        "enum": ["PASS", "FAIL"],
+                    },
+                    "abstract_quality_and_word_count": {"type": "string"},
+                    "structural_section_checks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "section_name": {"type": "string"},
+                                "detected_heading": {"type": "string"},
+                                "first_line_quote": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["PASS", "WARN", "FAIL", "NOT EVALUATED"],
+                                },
+                            },
+                            "required": ["section_name", "detected_heading", "first_line_quote", "status"],
+                            "additionalProperties": False,
+                        },
                     },
                 },
                 "required": [
                     "journal_style_compliance",
-                    "unwanted_thesis_subheadings_detected",
-                    "abstract_quality_check",
-                    "template_correction_instructions",
+                    "unwanted_thesis_subheadings",
+                    "template_placeholders_detected",
+                    "multidisciplinary_domains_compliance",
+                    "abstract_quality_and_word_count",
+                    "structural_section_checks",
                 ],
                 "additionalProperties": False,
             },
-            "structural_section_checks": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "section_name": {"type": "string"},
-                        "detected_heading": {"type": "string"},
-                        "first_line_quote": {"type": "string"},
-                        "status": {
-                            "type": "string",
-                            "enum": ["PASS", "WARN", "FAIL", "NOT EVALUATED (EXCERPT PROVIDED)"],
-                        },
-                    },
-                    "required": ["section_name", "detected_heading", "first_line_quote", "status"],
-                    "additionalProperties": False,
-                },
-            },
-            "visual_asset_audit": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "placement": {"type": "string"},
-                        "visual_present": {"type": "boolean"},
-                        "status": {
-                            "type": "string",
-                            "enum": ["PASS", "FAIL", "NOT EVALUATED (EXCERPT PROVIDED)"],
-                        },
-                    },
-                    "required": ["label", "placement", "visual_present", "status"],
-                    "additionalProperties": False,
-                },
-            },
-            "methodology_and_math_logic": {
+            "pass_3_statistical_and_mathematical_rigor": {
                 "type": "object",
                 "properties": {
-                    "theoretical_framework_present": {"type": "boolean"},
-                    "sample_size_check": {
-                        "type": "string",
-                        "enum": ["PASS", "WARN", "FAIL"],
-                    },
-                    "missing_domain_metrics": {
+                    "p_value_reporting_issues": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "software_reproducibility_notes": {"type": "string"},
+                    "pseudoreplication_flags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "statistical_test_completeness": {"type": "string"},
                 },
                 "required": [
-                    "theoretical_framework_present",
-                    "sample_size_check",
-                    "missing_domain_metrics",
-                    "software_reproducibility_notes",
+                    "p_value_reporting_issues",
+                    "pseudoreplication_flags",
+                    "statistical_test_completeness",
+                ],
+                "additionalProperties": False,
+            },
+            "pass_4_algorithmic_reproducibility": {
+                "type": "object",
+                "properties": {
+                    "is_computational_or_algorithm_paper": {"type": "boolean"},
+                    "algorithmic_edge_cases_notes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "software_dependency_versions": {"type": "string"},
+                    "benchmarks_and_scalability": {"type": "string"},
+                },
+                "required": [
+                    "is_computational_or_algorithm_paper",
+                    "algorithmic_edge_cases_notes",
+                    "software_dependency_versions",
+                    "benchmarks_and_scalability",
+                ],
+                "additionalProperties": False,
+            },
+            "pass_5_literal_text_and_captions": {
+                "type": "object",
+                "properties": {
+                    "enumeration_figure_inconsistencies": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "taxonomic_formatting_flags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "typographical_and_spacing_issues": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "visual_asset_audit": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "placement": {"type": "string"},
+                                "visual_present": {"type": "boolean"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["PASS", "FAIL", "NOT EVALUATED"],
+                                },
+                            },
+                            "required": ["label", "placement", "visual_present", "status"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": [
+                    "enumeration_figure_inconsistencies",
+                    "taxonomic_formatting_flags",
+                    "typographical_and_spacing_issues",
+                    "visual_asset_audit",
                 ],
                 "additionalProperties": False,
             },
@@ -445,10 +522,11 @@ AUDIT_STRICT_SCHEMA = {
         "required": [
             "manuscript_title",
             "editorial_verdict",
-            "template_format_audit",
-            "structural_section_checks",
-            "visual_asset_audit",
-            "methodology_and_math_logic",
+            "pass_1_cross_section_integrity",
+            "pass_2_template_and_layout",
+            "pass_3_statistical_and_mathematical_rigor",
+            "pass_4_algorithmic_reproducibility",
+            "pass_5_literal_text_and_captions",
         ],
         "additionalProperties": False,
     },
@@ -456,65 +534,75 @@ AUDIT_STRICT_SCHEMA = {
 
 
 # ============================================================
-# AUDIT ENGINE
+# AUDIT ENGINE (GROQ API IMPLEMENTATION OF MANDATORY PASSES)
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute pre-screening audit strictly matched against the MRJ template."""
-    preaudited, detected_thesis, template_obs = preaudit_mrj_template(raw_text)
+    preaudited, detected_thesis, detected_placeholders, template_obs = preaudit_mrj_template(raw_text)
 
-    prompt = f"""You are an expert scientific manuscript editorial auditor pre-screening submissions for the Multidisciplinary Research Journal (MRJ).
+    prompt = f"""You are an expert Lead Academic Editor and Manuscript Quality Auditor. Pre-screen this submission for the Multidisciplinary Research Journal (MRJ) by performing a strict 5-pass audit.
 
-CRITICAL AUDIT INSTRUCTIONS & MRJ TEMPLATE RULES:
+MANDATORY AUDIT PASSES:
 
-1. MRJ TEMPLATE FORMAT & JOURNAL STRUCTURAL COMPLIANCE:
-   - Audit whether the manuscript adheres to the MRJ template layout (Title, Abstract <=200w, 3-10 keywords separated by semicolons, 1. Introduction, 2. Materials and Methods, 3. Results and Discussion, 4. Conclusions, Multidisciplinary Domains, Funding, Acknowledgments, Conflicts of Interest, Declaration on AI Usage, References).
-   - Flag redundant or unintegrated thesis subheadings (e.g., separate subheadings for "Review of Literature", "Hypotheses", "Research Questions", "Statement of Problem", or "Delimitations"). State that these should be integrated directly into Introduction or Methods.
-   - Multidisciplinary Domains Requirement: Article MUST contain the exact statement: "This research covers the domains: (a) XXX, (b) YYY..." covering AT LEAST TWO domains.
-   - Declaration on AI Usage: Verify presence of declaration ("The authors declare that the article has been prepared without the use of AI tools" or declared AI usage).
-   - Check Abstract Quality: Verify if statistical/quantitative findings are reported or if the abstract relies on generic qualitative claims. Target length: single paragraph of ~200 words maximum.
+PASS 1: CROSS-SECTION CONTENT INTEGRITY & DISCREPANCY AUDIT
+- Extract every experiment, algorithm, dataset, or organism claimed in the ABSTRACT.
+- Cross-examine the METHODS and RESULTS sections to verify if each claimed study is explicitly present with empirical data.
+- Detail any discrepancies or phantom claims under 'abstract_body_discrepancies'.
 
-2. VERDICT CALIBRATION & ACTIONABLE RATIONALE:
-   - "Accept as is": Meets all MRJ template requirements and scientific criteria.
-   - "Accept with Minor Revisions": All core empirical sections intact; requires minor formatting adjustments (e.g., adding MRJ domain statement, AI declaration, or software version numbers).
-   - "Major Revisions": Core sections present, but literature review is purely descriptive, theoretical framework is missing, or subheadings violate standard journal layout (e.g., unadapted dissertation).
-   - For EVERY decision, provide an explicit, itemized array in "verdict_rationale" listing actionable steps for the author.
+PASS 2: TEMPLATE, LAYOUT & PLACEHOLDER AUDIT
+- Verify MRJ required sections: Abstract, Introduction, Materials and Methods, Results and Discussion, Conclusions, Multidisciplinary Domains, Funding, Acknowledgments, Conflicts of Interest, Declaration on AI Usage, References.
+- Check for unwanted thesis subheadings (e.g., 'Review of Related Literature', 'Statement of the Problem', 'Hypotheses', 'Research Questions', 'Objectives', 'Significance of the study', 'Delimitations').
+- Detect leftover template placeholders (e.g., 'ISSN XXXX-XXXX', 'DOI 10.XXXX/...', 'Volume XX', 'Received: date').
+- Verify Multidisciplinary Domains: must cover >= 2 domains with exact formulation 'This research covers the domains: (a) ..., (b) ...'.
+- Check Abstract: single paragraph, <= 200 words, quantitative metrics instead of generic qualitative claims.
 
-3. EXCERPT & HEADING SAFETY:
-   - Assign "PASS" if text body is present, even if a heading is implicit or unformatted (Abstract & Heading Flexibility Rule).
-   - Assign "NOT EVALUATED (EXCERPT PROVIDED)" ONLY if document truncation prevents full reading.
+PASS 3: STATISTICAL & MATHEMATICAL RIGOR AUDIT
+- Check for improper p-value reporting (e.g., 'p = 0.00' or 'p = 0' instead of 'p < 0.001').
+- Check for potential pseudoreplication (e.g., treating image pixels, technical replicates, or subsamples as independent observational units).
+- Verify all statistical tests state observational units, sample sizes, and degrees of freedom rationale.
 
-4. METHODOLOGICAL & SCIENTOMETRIC AUDIT:
-   - Audit for explicit theoretical frameworks, software versions (e.g., VOSviewer, Biblioshiny, SPSS), sample size justifications, and ethical approval statements.
+PASS 4: ALGORITHMIC & METHODOLOGICAL REPRODUCIBILITY AUDIT
+- If this is a software, algorithm, or data tool paper, audit whether the following edge cases are documented:
+  * Handling of ambiguous bases (e.g., 'N')
+  * Lowercase vs. uppercase sequences/strings
+  * Overlapping vs. non-overlapping k-mers
+  * Reverse complement handling
+  * Multi-chromosomal / multi-contig handling
+  * Exact software dependency version numbers (e.g., Python v3.10, OpenCV v4.5)
+  * Memory/runtime benchmarks for scalability claims.
+- If not a software paper, indicate is_computational_or_algorithm_paper: false and note methodological software reproducibility.
 
-PRE-SCANNED MRJ TEMPLATE OBSERVATIONS:
-- Pre-scanned Sections Evidence: {json.dumps(preaudited, indent=2)}
-- Thesis Subheadings Detected by Regex: {json.dumps(detected_thesis, indent=2)}
+PASS 5: LITERAL TEXT & FIGURE CAPTION AUDIT
+- Audit inline text enumerations against figures (check that lists match exact counts without omissions or duplicates).
+- Verify species names for binomial italicization (e.g., *E. coli*, *S. pneumoniae*, *M. tuberculosis*).
+- Detect punctuation anomalies, missing spaces after punctuation, or concatenated words.
+
+PRE-SCANNED DETERMINISTIC SIGNALS:
+- Pre-scanned Sections: {json.dumps(preaudited, indent=2)}
+- Unwanted Thesis Subheadings: {json.dumps(detected_thesis, indent=2)}
+- Template Placeholders Detected: {json.dumps(detected_placeholders, indent=2)}
 - Abstract Word Count: ~{template_obs['abstract_word_count']} words
-- Extracted Keywords ({len(template_obs['keywords_detected'])} found): {', '.join(template_obs['keywords_detected']) if template_obs['keywords_detected'] else 'None'}
-- Multidisciplinary Domains Statement Found: {template_obs['multidisciplinary_domains_found']} (Domains count: {template_obs['multidisciplinary_domains_count']})
-- Declaration on AI Usage Found: {template_obs['declaration_ai_usage_found']}
-- Square Bracket Citations [1] Detected: {template_obs['square_bracket_citations_found']}
+- Keywords Detected: {json.dumps(template_obs['keywords_detected'])}
+- Multidisciplinary Domains Detected: {template_obs['multidisciplinary_domains_count']} (Found: {template_obs['multidisciplinary_domains_found']})
+- Declaration on AI Usage Present: {template_obs['declaration_ai_usage_found']}
+- Regex Detected Improper P-values: {json.dumps(template_obs['improper_p_values_detected'])}
+- Visual Asset Captions: {json.dumps(asset_meta['detected_captions'], indent=2)}
 
-PRE-SCANNED FORMAL VISUAL CAPTIONS:
-{json.dumps(asset_meta['detected_captions'], indent=2)}
+MANUSCRIPT EXCERPT:
+--- START OF MANUSCRIPT ---
+{raw_text[:15000]}
+--- END OF MANUSCRIPT ---
 
-MANUSCRIPT TEXT BODY:
---- START OF TEXT ---
-{raw_text[:14000]}
---- END OF TEXT ---
-
-Return strictly valid, unformatted JSON following the exact schema."""
+Output strictly valid JSON complying with the requested schema."""
 
     messages = [
         {
             "role": "system",
-            "content": "You are an expert scientific manuscript editorial auditor. Output strictly valid JSON matching the requested schema.",
+            "content": "You are a rigorous Lead Academic Editor. Pre-screen submissions according to the 5-pass audit rules and return strictly valid JSON matching the schema.",
         },
         {"role": "user", "content": prompt},
     ]
 
-    # Attempt 1: Strict JSON Schema with Primary Model
     try:
         resp = client.chat.completions.create(
             model=PRIMARY_MODEL,
@@ -529,7 +617,6 @@ Return strictly valid, unformatted JSON following the exact schema."""
     except (BadRequestError, Exception):
         pass
 
-    # Attempt 2: Primary Model with JSON Object Mode
     try:
         resp = client.chat.completions.create(
             model=PRIMARY_MODEL,
@@ -544,7 +631,6 @@ Return strictly valid, unformatted JSON following the exact schema."""
     except (BadRequestError, Exception):
         pass
 
-    # Attempt 3: High-Reliability Fallback Model
     resp = client.chat.completions.create(
         model=FALLBACK_MODEL,
         messages=messages,
@@ -556,7 +642,7 @@ Return strictly valid, unformatted JSON following the exact schema."""
 
 
 # ============================================================
-# KEYWORD-BASED & RELEVANT REVIEWER DISCOVERY (OPENALEX)
+# OPENALEX REVIEWER DISCOVERY
 # ============================================================
 
 def openalex_get(url: str, params: Dict[str, Any], mailto: str = "") -> Dict[str, Any]:
@@ -586,13 +672,12 @@ def candidate_region_match(candidate: Dict[str, Any], region: str) -> bool:
 
 
 def search_openalex_by_query(query: str, region: str, matched_topic: str, mailto: str = "") -> List[Dict[str, Any]]:
-    """Query OpenAlex for authors publishing on a query term within a specific regional affiliation."""
     if not query.strip():
         return []
     try:
         data = openalex_get(
             OPENALEX_URL,
-            {"search": query, "per-page": 30, "sort": "publication_year:desc"},
+            {"search": query, "per-page": 25, "sort": "publication_year:desc"},
             mailto=mailto,
         )
     except Exception:
@@ -620,7 +705,7 @@ def search_openalex_by_query(query: str, region: str, matched_topic: str, mailto
                     "country": inst.get("country_code") or "",
                     "city": (inst.get("geo") or {}).get("city") or "",
                     "region": (inst.get("geo") or {}).get("region") or "",
-                    "match_type": f"Relevant Discipline Specialist (via '{matched_topic}')",
+                    "match_type": f"Specialist in {matched_topic}",
                     "recent_pubs": [],
                 }
                 if not candidate_region_match(candidate, region):
@@ -637,36 +722,24 @@ def reviewer_discovery_report(
     title: str,
     extracted_keywords: List[str],
     mailto: str = "",
-    max_per_region: int = 5,
+    max_per_region: int = 4,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Multi-stage reviewer search:
-    1. Direct title search.
-    2. Fallback to pertinent keywords from manuscript (so relevant reviewers are ALWAYS found).
-    3. Fallback to broad institutional domains in Assam / Northeast India / India.
-    """
     stopwords = {"a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "of", "by", "from", "using", "study", "analysis", "approach", "based"}
     title_terms = [w for w in re.findall(r"\b[A-Za-z]{3,}\b", title) if w.lower() not in stopwords]
 
-    # Priority queries list
     search_queries = []
-    # 1. Exact title key-phrase
     if title_terms:
         search_queries.append((" ".join(title_terms[:3]), "Manuscript Title Phrase"))
-    # 2. Extracted manuscript keywords
-    for kw in extracted_keywords[:4]:
+    for kw in extracted_keywords[:3]:
         if kw and len(kw) > 2:
             search_queries.append((kw, kw))
-    # 3. Individual title terms
-    for term in title_terms[:3]:
+    for term in title_terms[:2]:
         if term not in [sq[0] for sq in search_queries]:
             search_queries.append((term, term))
 
     output = {}
     for region in ["India", "Northeast India", "Assam"]:
         region_candidates = {}
-
-        # Progressively query until max_per_region candidates are gathered
         for q_str, q_label in search_queries:
             if len(region_candidates) >= max_per_region:
                 break
@@ -681,9 +754,7 @@ def reviewer_discovery_report(
         results = list(region_candidates.values())
         results.sort(key=lambda x: len(x["recent_pubs"]), reverse=True)
 
-        # Fallback if specific regional query returned fewer than 2 candidates
         if len(results) < 2 and region in ["Assam", "Northeast India"]:
-            # Query premier regional university hubs with general domain keyword
             fallback_kw = extracted_keywords[0] if extracted_keywords else (title_terms[0] if title_terms else "research")
             hub_query = f"IIT Guwahati {fallback_kw}" if region == "Assam" else f"Tezpur University {fallback_kw}"
             hub_found = search_openalex_by_query(hub_query, region, matched_topic=f"Regional Hub ({fallback_kw})", mailto=mailto)
@@ -694,6 +765,101 @@ def reviewer_discovery_report(
         output[region] = results[:max_per_region]
 
     return output
+
+
+# ============================================================
+# MARKDOWN REPORT GENERATOR (STRICT PROMPT TEMPLATE FORMAT)
+# ============================================================
+
+def generate_markdown_audit_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[str, Any]]]) -> str:
+    verd = audit.get("editorial_verdict", {})
+    p1 = audit.get("pass_1_cross_section_integrity", {})
+    p2 = audit.get("pass_2_template_and_layout", {})
+    p3 = audit.get("pass_3_statistical_and_mathematical_rigor", {})
+    p4 = audit.get("pass_4_algorithmic_reproducibility", {})
+    p5 = audit.get("pass_5_literal_text_and_captions", {})
+
+    # Actionable requirements list
+    reqs = verd.get("actionable_revision_requirements", [])
+    reqs_md = "\n".join([f"- {r}" for r in reqs]) if reqs else "- No mandatory revisions requested."
+
+    # Subheadings & Placeholders
+    unwanted = p2.get("unwanted_thesis_subheadings", [])
+    unwanted_str = ", ".join(unwanted) if unwanted else "None detected"
+
+    placeholders = p2.get("template_placeholders_detected", [])
+    placeholders_str = ", ".join(placeholders) if placeholders else "None"
+
+    # Discrepancies
+    disc = p1.get("abstract_body_discrepancies", [])
+    disc_str = "\n".join([f"- {d}" for d in disc]) if disc else "- No phantom claims or body discrepancies detected."
+
+    # P-values and Pseudoreplication
+    p_issues = p3.get("p_value_reporting_issues", [])
+    p_issues_str = "; ".join(p_issues) if p_issues else "None (properly formatted or p < 0.001 used)"
+
+    pseudo = p3.get("pseudoreplication_flags", [])
+    pseudo_str = "; ".join(pseudo) if pseudo else "None identified (sampling units accounted for)"
+
+    edge_cases = p4.get("algorithmic_edge_cases_notes", [])
+    edge_cases_str = "; ".join(edge_cases) if edge_cases else "None identified"
+    if p4.get("software_dependency_versions"):
+        edge_cases_str += f" | Versions: {p4.get('software_dependency_versions')}"
+
+    # Literal text & captions
+    enum_issues = p5.get("enumeration_figure_inconsistencies", [])
+    enum_str = "; ".join(enum_issues) if enum_issues else "Consistent with figures"
+
+    taxa = p5.get("taxonomic_formatting_flags", [])
+    typos = p5.get("typographical_and_spacing_issues", [])
+    taxa_str = "; ".join(taxa + typos) if (taxa or typos) else "Standard binomial nomenclature and formatting"
+
+    # Reviewer section
+    rev_lines = []
+    for reg, cands in reviewers.items():
+        rev_lines.append(f"#### {reg}")
+        if not cands:
+            rev_lines.append("- No verified OpenAlex profiles identified.")
+        for c in cands:
+            pubs_count = len(c.get("recent_pubs", []))
+            rev_lines.append(f"- **{c.get('name')}** ({c.get('institution')}): {c.get('match_type')} [{pubs_count} indexed works]")
+
+    reviewers_md = "\n".join(rev_lines)
+
+    report_md = f"""# MRJ Academic Pre-Screening & Editorial Audit Report
+
+**Manuscript Title:** {audit.get('manuscript_title', 'Not specified')}
+**Decision:** {verd.get('decision', 'Major Revisions')}
+
+### Executive Summary & Actionable Revision Requirements
+{verd.get('executive_summary', '')}
+
+{reqs_md}
+
+### 1. Template Compliance & Structural Audit
+- **Journal Style Compliance:** {p2.get('journal_style_compliance', 'FAIL')}
+- **Unwanted Thesis Subheadings:** {unwanted_str}
+- **Template Placeholders Detected:** {placeholders_str}
+- **Multidisciplinary Domains Statement:** {p2.get('multidisciplinary_domains_compliance', 'FAIL')}
+- **Abstract Quality & Word Count:** {p2.get('abstract_quality_and_word_count', 'N/A')}
+
+### 2. Cross-Section Consistency & Phantom Claim Audit
+- **Abstract vs. Body Discrepancies:**
+{disc_str}
+
+### 3. Statistical, Mathematical & Methodological Rigor
+- **P-Value Reporting Issues:** {p_issues_str}
+- **Pseudoreplication / Sampling Unit Flags:** {pseudo_str}
+- **Algorithmic Reproducibility Edge Cases:** {edge_cases_str}
+
+### 4. Text-Level & Technical Accuracy Flags
+- **Enumeration / Text-Figure Inconsistencies:** {enum_str}
+- **Taxonomic Formatting & Grammatical Typos:** {taxa_str}
+
+### 5. Verified Relevant Reviewer Discovery
+{reviewers_md}
+"""
+    return report_md
 
 
 # ============================================================
@@ -751,80 +917,86 @@ def generate_docx_report(
 
     verd = audit.get("editorial_verdict", {})
     doc.add_paragraph(f"Decision: {verd.get('decision', 'Under Review')}")
-    doc.add_paragraph(f"Summary Notes: {verd.get('summary_notes', '')}")
+    doc.add_paragraph(f"Executive Summary: {verd.get('executive_summary', '')}")
 
-    rationale_list = verd.get("verdict_rationale", [])
-    if rationale_list:
+    reqs = verd.get("actionable_revision_requirements", [])
+    if reqs:
         doc.add_heading("Actionable Revision Requirements for Authors:", level=2)
-        for r_item in rationale_list:
-            doc.add_paragraph(f"• {r_item}")
+        for r in reqs:
+            doc.add_paragraph(f"• {r}")
 
-    # MRJ Template Compliance Section
-    doc.add_heading("1. MRJ Template Format & Structural Compliance", level=1)
-    tf = audit.get("template_format_audit", {})
-    doc.add_paragraph(f"Journal Style Compliance: {tf.get('journal_style_compliance', 'N/A')}")
-    doc.add_paragraph(f"Multidisciplinary Domains Statement: {'Detected (>=2 domains)' if template_obs.get('multidisciplinary_domains_count', 0) >= 2 else 'Missing or Incomplete (<2 domains)'}")
-    doc.add_paragraph(f"Declaration on AI Usage Statement: {'Detected' if template_obs.get('declaration_ai_usage_found') else 'Missing'}")
-    doc.add_paragraph(f"Square-bracket Citations [1]: {'Detected' if template_obs.get('square_bracket_citations_found') else 'Missing or Inconsistent'}")
-
-    thesis_headers = tf.get("unwanted_thesis_subheadings_detected", [])
-    if thesis_headers:
-        doc.add_paragraph("Unwanted Thesis Subheadings Identified: " + ", ".join(thesis_headers))
+    # Pass 1
+    doc.add_heading("1. Cross-Section Content Integrity & Discrepancy Audit", level=1)
+    p1 = audit.get("pass_1_cross_section_integrity", {})
+    disc = p1.get("abstract_body_discrepancies", [])
+    if disc:
+        doc.add_paragraph("Abstract vs. Body Discrepancies Identified:")
+        for d in disc:
+            doc.add_paragraph(f"• {d}")
     else:
-        doc.add_paragraph("Unwanted Thesis Subheadings: None detected (Standard journal layout).")
-    doc.add_paragraph(f"Abstract Quality Assessment: {tf.get('abstract_quality_check', 'N/A')}")
+        doc.add_paragraph("Abstract claims are fully corroborated by empirical data in Methods and Results.")
 
-    instructions = tf.get("template_correction_instructions", [])
-    if instructions:
-        doc.add_paragraph("Structural Layout Instructions:")
-        for inst in instructions:
-            doc.add_paragraph(f"• {inst}")
+    # Pass 2
+    doc.add_heading("2. Template Compliance & Structural Audit", level=1)
+    p2 = audit.get("pass_2_template_and_layout", {})
+    doc.add_paragraph(f"Journal Style Compliance: {p2.get('journal_style_compliance', 'N/A')}")
+    doc.add_paragraph(f"Multidisciplinary Domains Statement: {p2.get('multidisciplinary_domains_compliance', 'N/A')}")
+    doc.add_paragraph(f"Abstract Word Count & Quality: {p2.get('abstract_quality_and_word_count', 'N/A')}")
 
-    # Structural Section Verification
-    doc.add_heading("2. Structural Section Verification", level=1)
+    placeholders = p2.get("template_placeholders_detected", [])
+    doc.add_paragraph(f"Template Placeholders: {', '.join(placeholders) if placeholders else 'None'}")
+
     tbl = doc.add_table(rows=1, cols=4)
     tbl.style = "Table Grid"
     h = tbl.rows[0].cells
     h[0].text, h[1].text, h[2].text, h[3].text = "Section", "Detected Heading", "First-Line Quote", "Status"
-    for s in audit.get("structural_section_checks", []):
+    for s in p2.get("structural_section_checks", []):
         row = tbl.add_row().cells
         row[0].text = s.get("section_name", "")
         row[1].text = s.get("detected_heading", "")
         row[2].text = s.get("first_line_quote", "")
         row[3].text = s.get("status", "")
 
-    # Visual Asset Audit
-    doc.add_heading("3. Visual Asset Audit", level=1)
+    # Pass 3
+    doc.add_heading("3. Statistical, Mathematical & Methodological Rigor", level=1)
+    p3 = audit.get("pass_3_statistical_and_mathematical_rigor", {})
+    p_issues = p3.get("p_value_reporting_issues", [])
+    doc.add_paragraph(f"P-Value Reporting Issues: {', '.join(p_issues) if p_issues else 'None detected'}")
+    pseudos = p3.get("pseudoreplication_flags", [])
+    doc.add_paragraph(f"Pseudoreplication Warnings: {', '.join(pseudos) if pseudos else 'None flagged'}")
+    doc.add_paragraph(f"Statistical Completeness: {p3.get('statistical_test_completeness', 'N/A')}")
+
+    # Pass 4
+    doc.add_heading("4. Algorithmic Reproducibility & Edge Cases", level=1)
+    p4 = audit.get("pass_4_algorithmic_reproducibility", {})
+    doc.add_paragraph(f"Computational/Algorithm Manuscript: {'Yes' if p4.get('is_computational_or_algorithm_paper') else 'No'}")
+    edge_notes = p4.get("algorithmic_edge_cases_notes", [])
+    if edge_notes:
+        for en in edge_notes:
+            doc.add_paragraph(f"• Edge case note: {en}")
+    doc.add_paragraph(f"Software Versions: {p4.get('software_dependency_versions', 'None specified')}")
+    doc.add_paragraph(f"Benchmarks / Scalability: {p4.get('benchmarks_and_scalability', 'None specified')}")
+
+    # Pass 5
+    doc.add_heading("5. Text-Level Accuracy & Visual Captions", level=1)
+    p5 = audit.get("pass_5_literal_text_and_captions", {})
     v_tbl = doc.add_table(rows=1, cols=4)
     v_tbl.style = "Table Grid"
     vh = v_tbl.rows[0].cells
-    vh[0].text, vh[1].text, vh[2].text, vh[3].text = "Label", "Placement", "Visual Present", "Status"
-    for v in audit.get("visual_asset_audit", []):
+    vh[0].text, vh[1].text, vh[2].text, vh[3].text = "Asset Label", "Placement", "Visual Present", "Status"
+    for v in p5.get("visual_asset_audit", []):
         row = v_tbl.add_row().cells
         row[0].text = v.get("label", "")
         row[1].text = v.get("placement", "")
         row[2].text = "Yes" if v.get("visual_present") else "No"
         row[3].text = v.get("status", "")
 
-    # Methodology & Math Logic
-    doc.add_heading("4. Methodology & Scientific Logic", level=1)
-    meth = audit.get("methodology_and_math_logic", {})
-    doc.add_paragraph(f"Theoretical Framework Present: {'Yes' if meth.get('theoretical_framework_present') else 'No'}")
-    doc.add_paragraph(f"Sample Size Accounting: {meth.get('sample_size_check', 'N/A')}")
-    missing_metrics = ", ".join(meth.get("missing_domain_metrics", [])) or "None identified"
-    doc.add_paragraph(f"Missing Domain Metrics: {missing_metrics}")
-    doc.add_paragraph(f"Software Reproducibility Notes: {meth.get('software_reproducibility_notes', '')}")
-
-    # Reviewer Candidates
-    doc.add_heading("5. Verified Relevant Reviewer Discovery (OpenAlex)", level=1)
+    # Reviewers
+    doc.add_heading("6. Verified Reviewer Discovery (OpenAlex)", level=1)
     for reg, cands in reviewers.items():
         doc.add_heading(reg, level=2)
-        if not cands:
-            doc.add_paragraph("No candidate profiles returned.")
-            continue
         for c in cands:
-            if "name" in c:
-                doc.add_paragraph(f"- {c['name']} ({c.get('institution', 'N/A')}): [{c.get('match_type', 'Relevant Specialist')}] - {len(c.get('recent_pubs', []))} recent publications")
+            doc.add_paragraph(f"• {c.get('name')} ({c.get('institution')}): {c.get('match_type')} - {len(c.get('recent_pubs', []))} recent publications")
 
     out = io.BytesIO()
     doc.save(out)
@@ -832,228 +1004,8 @@ def generate_docx_report(
 
 
 # ============================================================
-# STREAMLIT UI (STRUCTURED DASHBOARD - NO RAW JSON DUMP)
+# STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="MRJ Manuscript Editorial Auditor", page_icon="📄", layout="wide")
-st.title("📄 MRJ Manuscript Pre-Screening & Editorial Auditor")
-st.caption("Automated audit against Multidisciplinary Research Journal (MRJ) specifications and keyword-based regional reviewer discovery.")
-
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    groq_api_key = st.text_input("Groq API Key", value=get_secret("GROQ_API_KEY"), type="password")
-    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editor@mrjournal.org"))
-    st.markdown("---")
-    st.markdown("**MRJ Template Checkpoints:**")
-    st.markdown("1. **Multidisciplinary Domains**: Mandatory `(a)` & `(b)` statements.")
-    st.markdown("2. **Declaration on AI Usage**: Mandatory compliance statement.")
-    st.markdown("3. **Abstract & Keywords**: $\le 200$ words, 3–10 semicolon-separated keywords.")
-    st.markdown("4. **Thesis Architecture**: Identifies unintegrated dissertation headers.")
-    st.markdown("5. **Relevant Reviewers**: Discovers domain experts in Assam, Northeast India, & India.")
-
-uploaded_file = st.file_uploader("Upload Manuscript (.pdf or .docx)", type=["pdf", "docx"])
-
-if uploaded_file and st.button("🚀 Run MRJ Editorial Pre-Screening Audit", type="primary"):
-    if not groq_api_key:
-        st.error("Please provide a valid Groq API Key.")
-        st.stop()
-
-    try:
-        with st.spinner("Extracting text and scanning MRJ template layout..."):
-            raw_text, asset_meta = extract_text_and_assets(uploaded_file)
-            if not raw_text.strip():
-                st.error("Could not extract readable text from the uploaded document.")
-                st.stop()
-
-        with st.spinner("Pre-auditing sections, AI declaration, and thesis markers..."):
-            _, _, template_obs = preaudit_mrj_template(raw_text)
-
-        with st.spinner("Executing rigorous editorial & methodology audit with Groq AI..."):
-            client = Groq(api_key=groq_api_key)
-            audit_result = run_editorial_audit(raw_text, asset_meta, client)
-
-        with st.spinner("Discovering relevant regional peer reviewers via keywords & domain matching..."):
-            detected_title = audit_result.get("manuscript_title", "")
-            keywords_for_search = template_obs.get("keywords_detected", [])
-            reviewers = reviewer_discovery_report(detected_title, keywords_for_search, mailto=openalex_mailto)
-
-        with st.spinner("Compiling DOCX editorial report and blind reviewer copy..."):
-            orig_bytes = uploaded_file.getvalue()
-            blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
-            docx_report = generate_docx_report(audit_result, reviewers, template_obs)
-
-        st.session_state["audit"] = audit_result
-        st.session_state["reviewers"] = reviewers
-        st.session_state["template_obs"] = template_obs
-        st.session_state["blind_bytes"] = blind_bytes
-        st.session_state["docx_report"] = docx_report
-        st.success("MRJ pre-screening audit complete.")
-
-    except Exception as e:
-        st.error(f"Audit processing error: {e}")
-
-# Render results in structured dashboard (NO RAW JSON DUMP)
-if "audit" in st.session_state:
-    audit = st.session_state["audit"]
-    reviewers = st.session_state["reviewers"]
-    template_obs = st.session_state["template_obs"]
-    verd = audit.get("editorial_verdict", {})
-    decision = verd.get("decision", "Under Review")
-
-    st.markdown("---")
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if decision == "Accept as is":
-            st.success(f"### Verdict:\n**{decision}**")
-        elif decision == "Accept with Minor Revisions":
-            st.info(f"### Verdict:\n**{decision}**")
-        elif decision == "Major Revisions":
-            st.warning(f"### Verdict:\n**{decision}**")
-        else:
-            st.error(f"### Verdict:\n**{decision}**")
-    with c2:
-        st.subheader(audit.get("manuscript_title", "Untitled Manuscript"))
-        st.write(f"**Editorial Summary:** {verd.get('summary_notes', '')}")
-        rationale_items = verd.get("verdict_rationale", [])
-        if rationale_items:
-            st.markdown("**Actionable Revision Requirements for Authors:**")
-            for r_item in rationale_items:
-                st.markdown(f"- ⚠️ {r_item}")
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏛️ MRJ Template & Thesis Audit",
-        "📋 Section Verification",
-        "🖼️ Visual Asset Audit",
-        "🔬 Methodology & Theory Logic",
-        "👥 Relevant Reviewer Discovery",
-    ])
-
-    # Tab 1: Template Format & Thesis Compliance
-    with tab1:
-        st.subheader("MRJ Template Compliance & Dissertation Adaptation")
-        tf = audit.get("template_format_audit", {})
-        comp_status = tf.get("journal_style_compliance", "N/A")
-        badge = "🟢 PASS (Standard Journal Layout)" if comp_status == "PASS" else ("🟡 WARN (Thesis Artifacts Present)" if comp_status == "WARN" else "🔴 FAIL (Unadapted Dissertation)")
-        
-        m_c1, m_c2, m_c3, m_c4 = st.columns(4)
-        m_c1.metric("Journal Style Compliance", badge)
-        m_c2.metric("Multidisciplinary Domains", f"{template_obs.get('multidisciplinary_domains_count', 0)} detected (min. 2)")
-        m_c3.metric("Declaration on AI Usage", "✅ Present" if template_obs.get("declaration_ai_usage_found") else "❌ Missing")
-        m_c4.metric("Abstract Word Count", f"~{template_obs.get('abstract_word_count', 0)} words (limit 200)")
-
-        unwanted = tf.get("unwanted_thesis_subheadings_detected", [])
-        if unwanted:
-            st.warning("⚠️ **Unwanted Thesis/Dissertation Subheadings Detected:**\n\n" + ", ".join([f"`{u}`" for u in unwanted]))
-        else:
-            st.success("✅ **Standard Article Organization:** No unintegrated thesis subheadings detected.")
-
-        st.info(f"📊 **Abstract Quality & Quantitative Rigor:**\n\n{tf.get('abstract_quality_check', 'N/A')}")
-
-        instructions = tf.get("template_correction_instructions", [])
-        if instructions:
-            st.markdown("#### Layout Reorganization & Template Instructions:")
-            for inst in instructions:
-                st.markdown(f"- ✍️ {inst}")
-
-    # Tab 2: Structural Section Checks
-    with tab2:
-        st.subheader("Structural Section Checks")
-        struct_data = audit.get("structural_section_checks", [])
-        rows = []
-        for s in struct_data:
-            stat = s.get("status", "")
-            s_badge = "🟢 PASS" if stat == "PASS" else ("🟡 WARN" if stat == "WARN" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL"))
-            rows.append({
-                "Section": s.get("section_name"),
-                "Status": s_badge,
-                "Detected Heading": s.get("detected_heading"),
-                "First-Line Quote": s.get("first_line_quote"),
-            })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    # Tab 3: Visual Asset Audit
-    with tab3:
-        st.subheader("Formal Visual Asset Audit")
-        v_data = audit.get("visual_asset_audit", [])
-        if not v_data:
-            st.info("No formal figure or table captions detected.")
-        else:
-            v_rows = []
-            for v in v_data:
-                stat = v.get("status", "")
-                v_badge = "🟢 PASS" if stat == "PASS" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL")
-                v_rows.append({
-                    "Asset Label": v.get("label"),
-                    "Placement": v.get("placement"),
-                    "Visual Present": "✅ Yes" if v.get("visual_present") else "❌ No",
-                    "Status": v_badge,
-                })
-            st.dataframe(v_rows, use_container_width=True, hide_index=True)
-
-    # Tab 4: Methodology & Theory Logic
-    with tab4:
-        st.subheader("Methodology, Theoretical Framework & Reproducibility")
-        meth = audit.get("methodology_and_math_logic", {})
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Theoretical Framework", "✅ Present" if meth.get("theoretical_framework_present") else "❌ Missing / Unclear")
-        mc2.metric("Sample Size Accounting", meth.get("sample_size_check", "N/A"))
-        missing = meth.get("missing_domain_metrics", [])
-        mc3.write("**Missing Domain Metrics:**")
-        if missing:
-            for m in missing:
-                mc3.markdown(f"- ⚠️ `{m}`")
-        else:
-            mc3.write("✅ None identified as missing.")
-        st.info(f"**Software Reproducibility & Parameter Notes:**\n\n{meth.get('software_reproducibility_notes', 'None recorded.')}")
-
-    # Tab 5: Relevant Reviewer Discovery
-    with tab5:
-        st.subheader("Relevant Peer Reviewer Discovery (Keyword-Matched)")
-        st.caption(
-            "Reviewers are retrieved from OpenAlex. When exact-title publications are rare, candidates are "
-            "matched via the manuscript's extracted research keywords and subject domains to ensure relevant experts are always provided."
-        )
-        for region, cands in reviewers.items():
-            st.markdown(f"### Region: {region}")
-            if not cands:
-                st.write("No matching candidate profiles returned for this region.")
-                continue
-            r_rows = []
-            for c in cands:
-                pubs = c.get("recent_pubs", [])
-                latest_title = pubs[0]["title"] if pubs else "N/A"
-                r_rows.append({
-                    "Candidate Name": c.get("name"),
-                    "Institution": c.get("institution"),
-                    "Expertise Match Type": c.get("match_type", "Domain Specialist"),
-                    "Verified Works": len(pubs),
-                    "Recent Representative Publication": latest_title,
-                })
-            st.dataframe(r_rows, use_container_width=True, hide_index=True)
-
-    # Editorial Exports
-    st.markdown("---")
-    st.subheader("📥 Editorial Exports")
-    d1, d2, d3 = st.columns(3)
-    d1.download_button(
-        "📄 Download Editorial Report (.docx)",
-        data=st.session_state["docx_report"],
-        file_name="MRJ_Editorial_Audit_Report.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        use_container_width=True,
-    )
-    if uploaded_file.name.endswith(".docx"):
-        d2.download_button(
-            "🙈 Download Anonymized Blind Copy (.docx)",
-            data=st.session_state["blind_bytes"],
-            file_name="MRJ_Anonymized_Reviewer_Copy.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
-    d3.download_button(
-        "💾 Download Audit Data (.json)",
-        data=json.dumps(audit, indent=2),
-        file_name="mrj_audit_data.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+st.set_page_config(page_title="MRJ Manuscript Auditor (5-Pass Engine)", page_icon="📄", layout="wide")
+st.title("📄 MRJ Manuscript Quality Auditor & Pre-
