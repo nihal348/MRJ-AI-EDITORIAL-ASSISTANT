@@ -1008,4 +1008,249 @@ def generate_docx_report(
 # ============================================================
 
 st.set_page_config(page_title="MRJ Manuscript Auditor (5-Pass Engine)", page_icon="📄", layout="wide")
-st.title("📄 MRJ Manuscript Quality Auditor & Pre-
+st.title("📄 MRJ Manuscript Quality Auditor & Pre-Screening Engine")
+st.caption("Comprehensive 5-Pass editorial validation: Template compliance, cross-section consistency, statistical rigor, reproducibility, and OpenAlex reviewer discovery.")
+
+with st.sidebar:
+    st.header("⚙️ Editorial Settings")
+    groq_api_key = st.text_input("Groq API Key", value=get_secret("GROQ_API_KEY"), type="password")
+    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editor@mrjournal.org"))
+    st.markdown("---")
+    st.markdown("**MRJ 5-Pass Audit Core:**")
+    st.markdown("1. **Pass 1:** Cross-section integrity & phantom claims.")
+    st.markdown("2. **Pass 2:** Template, placeholders & layout.")
+    st.markdown("3. **Pass 3:** Statistical rigor & pseudoreplication.")
+    st.markdown("4. **Pass 4:** Algorithmic reproducibility & edge cases.")
+    st.markdown("5. **Pass 5:** Literal text accuracy & figure alignment.")
+
+uploaded_file = st.file_uploader("Upload Manuscript (.docx or .pdf)", type=["docx", "pdf"])
+
+if uploaded_file and st.button("🚀 Run Rigorous 5-Pass MRJ Audit", type="primary"):
+    if not groq_api_key:
+        st.error("Please provide a valid Groq API Key.")
+        st.stop()
+
+    try:
+        with st.spinner("Extracting manuscript body and scanning template landmarks..."):
+            raw_text, asset_meta = extract_text_and_assets(uploaded_file)
+            if not raw_text.strip():
+                st.error("Could not extract readable text from the uploaded document.")
+                st.stop()
+
+        with st.spinner("Executing regex checks on placeholders, p-values, and thesis subheadings..."):
+            _, _, _, template_obs = preaudit_mrj_template(raw_text)
+
+        with st.spinner("Running 5-Pass Auditor with Groq AI..."):
+            client = Groq(api_key=groq_api_key)
+            audit_result = run_editorial_audit(raw_text, asset_meta, client)
+
+        with st.spinner("Identifying relevant domain reviewers via OpenAlex..."):
+            detected_title = audit_result.get("manuscript_title", "")
+            keywords = template_obs.get("keywords_detected", [])
+            reviewers = reviewer_discovery_report(detected_title, keywords, mailto=openalex_mailto)
+
+        with st.spinner("Compiling structured Markdown and DOCX reports..."):
+            md_report = generate_markdown_audit_report(audit_result, reviewers)
+            orig_bytes = uploaded_file.getvalue()
+            blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
+            docx_report = generate_docx_report(audit_result, reviewers, template_obs)
+
+        st.session_state["audit"] = audit_result
+        st.session_state["reviewers"] = reviewers
+        st.session_state["template_obs"] = template_obs
+        st.session_state["md_report"] = md_report
+        st.session_state["blind_bytes"] = blind_bytes
+        st.session_state["docx_report"] = docx_report
+        st.success("5-Pass editorial audit complete.")
+
+    except Exception as e:
+        st.error(f"Audit processing error: {e}")
+
+
+# Display Audit Findings
+if "audit" in st.session_state:
+    audit = st.session_state["audit"]
+    reviewers = st.session_state["reviewers"]
+    template_obs = st.session_state["template_obs"]
+    md_report = st.session_state["md_report"]
+    verd = audit.get("editorial_verdict", {})
+    decision = verd.get("decision", "Major Revisions")
+
+    st.markdown("---")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if decision == "Accept as is":
+            st.success(f"### Verdict:\n**{decision}**")
+        elif decision == "Accept with Minor Revisions":
+            st.info(f"### Verdict:\n**{decision}**")
+        elif decision == "Major Revisions":
+            st.warning(f"### Verdict:\n**{decision}**")
+        else:
+            st.error(f"### Verdict:\n**{decision}**")
+    with c2:
+        st.subheader(audit.get("manuscript_title", "Untitled Manuscript"))
+        st.write(f"**Executive Summary:** {verd.get('executive_summary', '')}")
+        reqs = verd.get("actionable_revision_requirements", [])
+        if reqs:
+            st.markdown("**Actionable Revision Requirements:**")
+            for r in reqs:
+                st.markdown(f"- ⚠️ {r}")
+
+    t_md, t1, t2, t3, t4, t5, t_rev = st.tabs([
+        "📄 Structured Markdown Report",
+        "Pass 1: Cross-Section Integrity",
+        "Pass 2: Template & Sections",
+        "Pass 3: Statistical Rigor",
+        "Pass 4: Reproducibility",
+        "Pass 5: Text & Captions",
+        "👥 Reviewer Discovery",
+    ])
+
+    with t_md:
+        st.markdown(md_report)
+
+    with t1:
+        st.subheader("Pass 1: Cross-Section Content Integrity & Phantom Claim Audit")
+        p1 = audit.get("pass_1_cross_section_integrity", {})
+        st.markdown("**Experiments/Claims Extracted from Abstract:**")
+        for item in p1.get("abstract_claimed_items", []):
+            st.markdown(f"- 🔬 {item}")
+
+        discs = p1.get("abstract_body_discrepancies", [])
+        if discs:
+            st.error("**Discrepancies & Phantom Claims Flagged:**")
+            for d in discs:
+                st.markdown(f"- ❌ {d}")
+        else:
+            st.success("✅ No discrepancies detected between Abstract claims and empirical data.")
+
+    with t2:
+        st.subheader("Pass 2: Template, Layout & Placeholder Audit")
+        p2 = audit.get("pass_2_template_and_layout", {})
+        col_p1, col_p2, col_p3 = st.columns(3)
+        col_p1.metric("Journal Style Compliance", p2.get("journal_style_compliance", "N/A"))
+        col_p2.metric("Multidisciplinary Domains", p2.get("multidisciplinary_domains_compliance", "N/A"))
+        col_p3.metric("Abstract Words", f"~{template_obs.get('abstract_word_count', 0)}")
+
+        phs = p2.get("template_placeholders_detected", [])
+        if phs:
+            st.warning("⚠️ **Template Placeholders Detected:**\n\n" + ", ".join([f"`{p}`" for p in phs]))
+        else:
+            st.success("✅ No template placeholders identified.")
+
+        unw = p2.get("unwanted_thesis_subheadings", [])
+        if unw:
+            st.warning("⚠️ **Unwanted Dissertation Subheadings Identified:**\n\n" + ", ".join([f"`{u}`" for u in unw]))
+        else:
+            st.success("✅ Standard journal section hierarchy maintained.")
+
+        st.dataframe(p2.get("structural_section_checks", []), use_container_width=True, hide_index=True)
+
+    with t3:
+        st.subheader("Pass 3: Statistical & Mathematical Rigor Audit")
+        p3 = audit.get("pass_3_statistical_and_mathematical_rigor", {})
+        p_issues = p3.get("p_value_reporting_issues", [])
+        if p_issues:
+            st.warning("⚠️ **Improper P-Value Reporting Flagged (e.g. p = 0.00):**")
+            for pi in p_issues:
+                st.markdown(f"- {pi}")
+        else:
+            st.success("✅ P-values properly reported without absolute zero statements.")
+
+        pseudos = p3.get("pseudoreplication_flags", [])
+        if pseudos:
+            st.warning("⚠️ **Potential Pseudoreplication / Unit Issues:**")
+            for ps in pseudos:
+                st.markdown(f"- {ps}")
+        else:
+            st.success("✅ Observational and experimental units appropriately differentiated.")
+
+        st.info(f"**Statistical Test Completeness:** {p3.get('statistical_test_completeness', 'N/A')}")
+
+    with t4:
+        st.subheader("Pass 4: Algorithmic & Methodological Reproducibility Audit")
+        p4 = audit.get("pass_4_algorithmic_reproducibility", {})
+        st.write(f"**Computational/Tool Paper:** {'Yes' if p4.get('is_computational_or_algorithm_paper') else 'No'}")
+        edge_cases = p4.get("algorithmic_edge_cases_notes", [])
+        if edge_cases:
+            st.warning("**Reproducibility & Edge Case Observations:**")
+            for ec in edge_cases:
+                st.markdown(f"- {ec}")
+        else:
+            st.success("✅ No major algorithmic reproducibility gaps identified.")
+
+        st.write(f"**Software Dependency Versions:** {p4.get('software_dependency_versions', 'None specified')}")
+        st.write(f"**Scalability & Benchmarks:** {p4.get('benchmarks_and_scalability', 'None recorded')}")
+
+    with t5:
+        st.subheader("Pass 5: Literal Text & Visual Caption Audit")
+        p5 = audit.get("pass_5_literal_text_and_captions", {})
+        enums = p5.get("enumeration_figure_inconsistencies", [])
+        if enums:
+            st.warning("**Enumeration & Figure Discrepancies:**")
+            for en in enums:
+                st.markdown(f"- {en}")
+        else:
+            st.success("✅ Textual enumerations and figure elements align.")
+
+        taxa = p5.get("taxonomic_formatting_flags", [])
+        if taxa:
+            st.warning("**Taxonomic Nomenclature / Formatting Flags:**")
+            for tx in taxa:
+                st.markdown(f"- {tx}")
+        else:
+            st.success("✅ Taxonomic formatting compliant.")
+
+        st.dataframe(p5.get("visual_asset_audit", []), use_container_width=True, hide_index=True)
+
+    with t_rev:
+        st.subheader("Verified Relevant Reviewer Discovery (OpenAlex)")
+        for region, cands in reviewers.items():
+            st.markdown(f"### Region: {region}")
+            if not cands:
+                st.write("No matching candidates located.")
+                continue
+            r_rows = []
+            for c in cands:
+                pubs = c.get("recent_pubs", [])
+                r_rows.append({
+                    "Candidate Name": c.get("name"),
+                    "Affiliation": c.get("institution"),
+                    "Specialization": c.get("match_type"),
+                    "Indexed Publications": len(pubs),
+                    "Representative Work": pubs[0]["title"] if pubs else "N/A",
+                })
+            st.dataframe(r_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("📥 Editorial Exports")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.download_button(
+        "📝 Download Markdown Report (.md)",
+        data=st.session_state["md_report"],
+        file_name="MRJ_Editorial_Audit_Report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+    d2.download_button(
+        "📄 Download Word Report (.docx)",
+        data=st.session_state["docx_report"],
+        file_name="MRJ_Editorial_Audit_Report.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
+    )
+    if uploaded_file.name.endswith(".docx"):
+        d3.download_button(
+            "🙈 Download Blind Reviewer Copy (.docx)",
+            data=st.session_state["blind_bytes"],
+            file_name="MRJ_Anonymized_Reviewer_Copy.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+    d4.download_button(
+        "💾 Download Audit JSON (.json)",
+        data=json.dumps(audit, indent=2),
+        file_name="mrj_audit_data.json",
+        mime="application/json",
+        use_container_width=True,
+    )
