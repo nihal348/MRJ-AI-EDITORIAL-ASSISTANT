@@ -61,6 +61,16 @@ SECTION_PATTERNS = {
     "Ethics Statement": r"(?i)^\s*(?:ethics\s+statement|ethical\s+approval|ethics\s+approval|institutional\s+review\s+board|irb\s+statement)\s*:?$",
 }
 
+THESIS_SUBHEADING_PATTERNS = [
+    r"(?i)\b(?:review of (?:related )?literature|literature review)\b",
+    r"(?i)\b(?:statement of (?:the )?problem|problem statement)\b",
+    r"(?i)\b(?:hypotheses|hypothesis development)\b",
+    r"(?i)\b(?:research questions?)\b",
+    r"(?i)\b(?:delimitations?|scope and delimitations?)\b",
+    r"(?i)\b(?:significance of (?:the )?study)\b",
+    r"(?i)\b(?:conceptual framework|theoretical framework)\b",
+]
+
 NORTHEAST_STATES = {
     "assam", "arunachal pradesh", "manipur", "meghalaya", "mizoram", "nagaland", "sikkim", "tripura"
 }
@@ -118,15 +128,18 @@ def clean_json_response(raw_resp: str) -> Dict[str, Any]:
 # DETERMINISTIC PRE-AUDIT & ASSET EXTRACTION
 # ============================================================
 
-def preaudit_sections(text: str) -> List[Dict[str, Any]]:
-    """Scan document text hierarchy with Heading & Abstract flexibility."""
+def preaudit_sections_and_thesis_headers(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Scan document text hierarchy with Heading/Abstract flexibility and thesis subheadings pre-check."""
     lines = text.splitlines()
     detected_map = {}
+    detected_thesis_headers = []
 
     for i, line in enumerate(lines):
         clean = normalize(line)
         if not clean or len(clean) > 85:
             continue
+
+        # Check standard sections
         for sec_name, pattern in SECTION_PATTERNS.items():
             if sec_name in detected_map:
                 continue
@@ -143,7 +156,12 @@ def preaudit_sections(text: str) -> List[Dict[str, Any]]:
                     "line_num": i,
                 }
 
-    # Abstract Flexibility Rule: scan front matter for unlabelled abstract paragraph
+        # Check for thesis/dissertation subheadings
+        for t_pattern in THESIS_SUBHEADING_PATTERNS:
+            if re.match(t_pattern, clean) and clean not in detected_thesis_headers:
+                detected_thesis_headers.append(clean)
+
+    # Abstract Flexibility Rule
     if "Abstract" not in detected_map:
         intro_line = detected_map.get("Introduction", {}).get("line_num", len(lines))
         search_limit = min(len(lines), intro_line, 40)
@@ -178,7 +196,8 @@ def preaudit_sections(text: str) -> List[Dict[str, Any]]:
                 "first_line_quote": "N/A",
                 "status_hint": "FAIL" if sec in CORE_SECTIONS else "WARN",
             })
-    return preaudited
+
+    return preaudited, detected_thesis_headers
 
 
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
@@ -259,7 +278,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 
 
 # ============================================================
-# AUDIT JSON SCHEMA SPECIFICATION
+# AUDIT JSON SCHEMA SPECIFICATION (MATCHES PROMPT)
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
@@ -288,6 +307,31 @@ AUDIT_STRICT_SCHEMA = {
                     "summary_notes": {"type": "string"},
                 },
                 "required": ["decision", "verdict_rationale", "summary_notes"],
+                "additionalProperties": False,
+            },
+            "template_format_audit": {
+                "type": "object",
+                "properties": {
+                    "journal_style_compliance": {
+                        "type": "string",
+                        "enum": ["PASS", "WARN", "FAIL"],
+                    },
+                    "unwanted_thesis_subheadings_detected": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "abstract_quality_check": {"type": "string"},
+                    "template_correction_instructions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "journal_style_compliance",
+                    "unwanted_thesis_subheadings_detected",
+                    "abstract_quality_check",
+                    "template_correction_instructions",
+                ],
                 "additionalProperties": False,
             },
             "structural_section_checks": {
@@ -327,6 +371,7 @@ AUDIT_STRICT_SCHEMA = {
             "methodology_and_math_logic": {
                 "type": "object",
                 "properties": {
+                    "theoretical_framework_present": {"type": "boolean"},
                     "sample_size_check": {
                         "type": "string",
                         "enum": ["PASS", "WARN", "FAIL"],
@@ -337,13 +382,19 @@ AUDIT_STRICT_SCHEMA = {
                     },
                     "software_reproducibility_notes": {"type": "string"},
                 },
-                "required": ["sample_size_check", "missing_domain_metrics", "software_reproducibility_notes"],
+                "required": [
+                    "theoretical_framework_present",
+                    "sample_size_check",
+                    "missing_domain_metrics",
+                    "software_reproducibility_notes",
+                ],
                 "additionalProperties": False,
             },
         },
         "required": [
             "manuscript_title",
             "editorial_verdict",
+            "template_format_audit",
             "structural_section_checks",
             "visual_asset_audit",
             "methodology_and_math_logic",
@@ -358,36 +409,35 @@ AUDIT_STRICT_SCHEMA = {
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute rigorous pre-screening audit enforcing all critical audit rules."""
-    preaudited = preaudit_sections(raw_text)
+    """Execute pre-screening audit enforcing template compliance, thesis detection, and methodology audit."""
+    preaudited, detected_thesis = preaudit_sections_and_thesis_headers(raw_text)
 
-    prompt = f"""You are an expert scientific manuscript editorial auditor. Conduct a thorough, evidence-based pre-screening audit of the provided manuscript.
+    prompt = f"""You are an expert scientific manuscript editorial auditor conducting a comprehensive pre-screening audit. Evaluate both structural completeness AND academic editorial quality prior to human peer review.
 
-CRITICAL AUDIT RULES:
+CRITICAL AUDIT INSTRUCTIONS:
 
-1. VERDICT CALIBRATION & CLEAR AUTHOR RATIONALE (STRICT):
-   - DO NOT assign "Major Revisions" or "Reject" solely for missing optional sections (e.g., Ethics Statement, Acknowledgments) or minor software parameter omissions if all core empirical sections (Abstract, Introduction, Methods, Results, Conclusion) are PASS.
-   - Assign "Accept with Minor Revisions" when core content is intact but minor declarations or parameters are missing.
-   - For EVERY verdict, you MUST provide an explicit, bulleted array in "verdict_rationale" listing the exact reasons for the decision so the author knows precisely what needs revision.
+1. TEMPLATE FORMAT & JOURNAL STRUCTURAL COMPLIANCE:
+   - Audit whether the manuscript follows standard journal article formatting vs. an unadapted thesis/dissertation structure.
+   - Flag redundant or unintegrated subheadings (e.g., separate subheadings for "Review of Literature", "Hypotheses", "Research Questions", "Statement of Problem", or "Delimitations"). State if these should be integrated directly into Introduction or Methods.
+   - Check Abstract quality: verify if statistical findings (e.g., p-values, effect sizes, sample sizes) are explicitly reported or if the abstract relies on generic claims.
 
-2. EXCERPT & TRUNCATION SAFETY CONSTRAINT:
-   - Do NOT mark a section as "FAIL" or "Not Found" if you are evaluating an incomplete excerpt or fragment of a document.
-   - If a section is absent due to document truncation, mark its status strictly as "NOT EVALUATED (EXCERPT PROVIDED)".
-   - Mark a section as "FAIL" ONLY if the manuscript is complete and a required core section is missing entirely.
+2. VERDICT CALIBRATION & ACTIONABLE RATIONALE:
+   - "Accept with Minor Revisions": All core empirical sections are intact; requires minor formatting, statement additions, or software version updates.
+   - "Major Revisions": Core sections present, but literature review is purely descriptive, theoretical framework is missing, or subheadings violate standard journal layout.
+   - For EVERY decision, provide an explicit, itemized array in "verdict_rationale" listing actionable steps for the author.
 
-3. ABSTRACT & HEADING FLEXIBILITY RULE:
-   - If a section's text body or first-line quote is detected (e.g., the abstract paragraph at the top of the paper), mark its status as "PASS" or "WARN", even if an explicit section heading like "ABSTRACT" is absent or unformatted.
+3. EXCERPT & HEADING SAFETY:
+   - Assign "PASS" if text body is present, even if a heading is implicit or unformatted.
+   - Assign "NOT EVALUATED (EXCERPT PROVIDED)" ONLY if document truncation prevents full reading.
 
-4. MANUSCRIPT TITLE RESOLUTION:
-   - Extract the full, actual academic article title.
-   - NEVER output a DOI link, URL string, header metadata, or journal name as the manuscript title.
-
-5. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
-   - For bibliometric/scientometric studies, explicitly audit and report whether standard domain metrics are present: h-index, g-index, m-index.
-   - For empirical/survey studies, audit for software version numbers, statistical parameter settings, or sample size justifications.
+4. METHODOLOGICAL & SCIENTOMETRIC AUDIT:
+   - Audit for explicit theoretical frameworks, software versions (e.g., SPSS v28, VOSviewer v1.6.19), sample size justifications, and ethical approval statements.
 
 PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT:
 {json.dumps(preaudited, indent=2)}
+
+POTENTIAL THESIS/DISSERTATION SUBHEADINGS DETECTED BY REGEX:
+{json.dumps(detected_thesis, indent=2)}
 
 PRE-SCANNED FORMAL VISUAL CAPTIONS:
 {json.dumps(asset_meta['detected_captions'], indent=2)}
@@ -583,21 +633,37 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 
 def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[str, Any]]]) -> bytes:
     doc = Document()
-    doc.add_heading("Scientific Manuscript Editorial Pre-Screening Audit Report", 0)
+    doc.add_heading("Academic Pre-Screening & Editorial Audit Report", 0)
     doc.add_paragraph(f"Manuscript Title: {audit.get('manuscript_title', 'Not specified')}")
 
     verd = audit.get("editorial_verdict", {})
     doc.add_paragraph(f"Decision: {verd.get('decision', 'Under Review')}")
     doc.add_paragraph(f"Summary Notes: {verd.get('summary_notes', '')}")
 
-    # Actionable revision requirements
     rationale_list = verd.get("verdict_rationale", [])
     if rationale_list:
         doc.add_heading("Actionable Revision Requirements for Authors:", level=2)
         for r_item in rationale_list:
             doc.add_paragraph(f"• {r_item}")
 
-    doc.add_heading("1. Structural Section Verification", level=1)
+    # Template Format Audit Section
+    doc.add_heading("1. Template Format & Journal Structural Compliance", level=1)
+    tf = audit.get("template_format_audit", {})
+    doc.add_paragraph(f"Journal Style Compliance: {tf.get('journal_style_compliance', 'N/A')}")
+    thesis_headers = tf.get("unwanted_thesis_subheadings_detected", [])
+    if thesis_headers:
+        doc.add_paragraph("Unwanted Thesis Subheadings Identified: " + ", ".join(thesis_headers))
+    else:
+        doc.add_paragraph("Unwanted Thesis Subheadings: None detected (Standard journal layout).")
+    doc.add_paragraph(f"Abstract Quality Assessment: {tf.get('abstract_quality_check', 'N/A')}")
+    instructions = tf.get("template_correction_instructions", [])
+    if instructions:
+        doc.add_paragraph("Structural Layout Instructions:")
+        for inst in instructions:
+            doc.add_paragraph(f"• {inst}")
+
+    # Structural Section Verification
+    doc.add_heading("2. Structural Section Verification", level=1)
     tbl = doc.add_table(rows=1, cols=4)
     tbl.style = "Table Grid"
     h = tbl.rows[0].cells
@@ -609,7 +675,8 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
         row[2].text = s.get("first_line_quote", "")
         row[3].text = s.get("status", "")
 
-    doc.add_heading("2. Visual Asset Audit", level=1)
+    # Visual Asset Audit
+    doc.add_heading("3. Visual Asset Audit", level=1)
     v_tbl = doc.add_table(rows=1, cols=4)
     v_tbl.style = "Table Grid"
     vh = v_tbl.rows[0].cells
@@ -621,14 +688,17 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
         row[2].text = "Yes" if v.get("visual_present") else "No"
         row[3].text = v.get("status", "")
 
-    doc.add_heading("3. Methodology & Math Logic", level=1)
+    # Methodology & Math Logic
+    doc.add_heading("4. Methodology & Scientific Logic", level=1)
     meth = audit.get("methodology_and_math_logic", {})
+    doc.add_paragraph(f"Theoretical Framework Present: {'Yes' if meth.get('theoretical_framework_present') else 'No'}")
     doc.add_paragraph(f"Sample Size Accounting: {meth.get('sample_size_check', 'N/A')}")
     missing_metrics = ", ".join(meth.get("missing_domain_metrics", [])) or "None identified"
     doc.add_paragraph(f"Missing Domain Metrics: {missing_metrics}")
     doc.add_paragraph(f"Software Reproducibility Notes: {meth.get('software_reproducibility_notes', '')}")
 
-    doc.add_heading("4. Potential Reviewer Candidates (OpenAlex)", level=1)
+    # Reviewer Candidates
+    doc.add_heading("5. Verified Reviewer Discovery (OpenAlex)", level=1)
     for reg, cands in reviewers.items():
         doc.add_heading(reg, level=2)
         for c in cands:
@@ -641,12 +711,12 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
 
 
 # ============================================================
-# STREAMLIT UI (STRUCTURED EDITORIAL DASHBOARD)
+# STREAMLIT UI (STRUCTURED DASHBOARD - NO RAW JSON DUMP)
 # ============================================================
 
-st.set_page_config(page_title="Manuscript Editorial Auditor", page_icon="📑", layout="wide")
-st.title("📑 Scientific Manuscript Pre-Screening & Editorial Auditor")
-st.caption("Evidence-based structural auditing, caption deduplication, and scientometric reproducibility analysis.")
+st.set_page_config(page_title="Academic Manuscript Editorial Auditor", page_icon="🎓", layout="wide")
+st.title("🎓 Academic Pre-Screening & Editorial Auditor")
+st.caption("Structural completeness, thesis format adaptation checks, scientometrics, and reviewer discovery.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -654,35 +724,34 @@ with st.sidebar:
     openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editorial-auditor@mrjournal.org"))
     st.markdown("---")
     st.markdown("**Critical Pre-Screening Directives:**")
-    st.markdown("1. **Verdict Calibration**: Actionable bulleted revision requirements; no harsh rejection solely for optional omissions.")
-    st.markdown("2. **Truncation Safety**: Missing sections in excerpts marked as `NOT EVALUATED (EXCERPT PROVIDED)`.")
-    st.markdown("3. **Abstract & Heading Flexibility**: Section passes if body text/quote is found, even if unlabelled.")
-    st.markdown("4. **Title Resolution**: Full article title; no DOIs/URLs.")
-    st.markdown("5. **Scientometrics**: Checks h/g/m indices & software parameters.")
+    st.markdown("1. **Thesis Subheading Check**: Flags unadapted dissertation headers (e.g., 'Review of Related Literature', 'Hypotheses').")
+    st.markdown("2. **Abstract Quality**: Audits quantitative findings (p-values, effect sizes) vs generic claims.")
+    st.markdown("3. **Theoretical Rigor**: Checks explicit theoretical framework presence.")
+    st.markdown("4. **Actionable Verdict Rationale**: Explicit revision requirements for authors.")
 
 uploaded_file = st.file_uploader("Upload Manuscript (.pdf or .docx)", type=["pdf", "docx"])
 
-if uploaded_file and st.button("🚀 Conduct Evidence-Based Audit", type="primary"):
+if uploaded_file and st.button("🚀 Conduct Comprehensive Editorial Audit", type="primary"):
     if not groq_api_key:
         st.error("Please provide a valid Groq API Key.")
         st.stop()
 
     try:
-        with st.spinner("Extracting text hierarchy and auditing visual assets..."):
+        with st.spinner("Extracting document hierarchy, checking thesis markers, and auditing assets..."):
             raw_text, asset_meta = extract_text_and_assets(uploaded_file)
             if not raw_text.strip():
                 st.error("Could not extract readable text from the uploaded document.")
                 st.stop()
 
-        with st.spinner("Executing line-by-line editorial audit with Groq AI..."):
+        with st.spinner("Executing rigorous editorial & methodology audit with Groq AI..."):
             client = Groq(api_key=groq_api_key)
             audit_result = run_editorial_audit(raw_text, asset_meta, client)
 
-        with st.spinner("Querying OpenAlex for verified regional reviewers..."):
+        with st.spinner("Querying OpenAlex for verified regional peer reviewers..."):
             detected_title = audit_result.get("manuscript_title", "")
             reviewers = reviewer_discovery_report(detected_title, mailto=openalex_mailto)
 
-        with st.spinner("Compiling DOCX report and anonymized copy..."):
+        with st.spinner("Compiling DOCX editorial report and blind reviewer copy..."):
             orig_bytes = uploaded_file.getvalue()
             blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
             docx_report = generate_docx_report(audit_result, reviewers)
@@ -691,7 +760,7 @@ if uploaded_file and st.button("🚀 Conduct Evidence-Based Audit", type="primar
         st.session_state["reviewers"] = reviewers
         st.session_state["blind_bytes"] = blind_bytes
         st.session_state["docx_report"] = docx_report
-        st.success("Audit complete.")
+        st.success("Comprehensive pre-screening audit complete.")
 
     except Exception as e:
         st.error(f"Audit processing error: {e}")
@@ -723,31 +792,54 @@ if "audit" in st.session_state:
             for r_item in rationale_items:
                 st.markdown(f"- ⚠️ {r_item}")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🏛️ Structural Section Verification",
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🏛️ Template & Thesis Audit",
+        "📋 Section Verification",
         "🖼️ Visual Asset Audit",
-        "🔬 Methodology & Math Logic",
+        "🔬 Methodology & Theory Logic",
         "👥 Verified Reviewer Candidates",
     ])
 
-    # Tab 1: Structural Section Checks
+    # Tab 1: Template Format & Thesis Compliance
     with tab1:
+        st.subheader("Template Format & Journal Compliance Audit")
+        tf = audit.get("template_format_audit", {})
+        comp_status = tf.get("journal_style_compliance", "N/A")
+        badge = "🟢 PASS (Standard Journal Layout)" if comp_status == "PASS" else ("🟡 WARN (Thesis Artifacts Present)" if comp_status == "WARN" else "🔴 FAIL (Unadapted Dissertation)")
+        st.metric("Journal Style Compliance", badge)
+
+        unwanted = tf.get("unwanted_thesis_subheadings_detected", [])
+        if unwanted:
+            st.warning("⚠️ **Unwanted Thesis/Dissertation Subheadings Detected:**\n\n" + ", ".join([f"`{u}`" for u in unwanted]))
+        else:
+            st.success("✅ **Standard Article Organization:** No unintegrated thesis subheadings detected.")
+
+        st.info(f"📊 **Abstract Quality & Quantitative Rigor:**\n\n{tf.get('abstract_quality_check', 'N/A')}")
+
+        instructions = tf.get("template_correction_instructions", [])
+        if instructions:
+            st.markdown("#### Layout Reorganization & Template Instructions:")
+            for inst in instructions:
+                st.markdown(f"- ✍️ {inst}")
+
+    # Tab 2: Structural Section Checks
+    with tab2:
         st.subheader("Structural Section Checks")
         struct_data = audit.get("structural_section_checks", [])
         rows = []
         for s in struct_data:
             stat = s.get("status", "")
-            badge = "🟢 PASS" if stat == "PASS" else ("🟡 WARN" if stat == "WARN" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL"))
+            s_badge = "🟢 PASS" if stat == "PASS" else ("🟡 WARN" if stat == "WARN" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL"))
             rows.append({
                 "Section": s.get("section_name"),
-                "Status": badge,
+                "Status": s_badge,
                 "Detected Heading": s.get("detected_heading"),
                 "First-Line Quote": s.get("first_line_quote"),
             })
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    # Tab 2: Visual Asset Audit
-    with tab2:
+    # Tab 3: Visual Asset Audit
+    with tab3:
         st.subheader("Formal Visual Asset Audit")
         v_data = audit.get("visual_asset_audit", [])
         if not v_data:
@@ -756,34 +848,35 @@ if "audit" in st.session_state:
             v_rows = []
             for v in v_data:
                 stat = v.get("status", "")
-                badge = "🟢 PASS" if stat == "PASS" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL")
+                v_badge = "🟢 PASS" if stat == "PASS" else ("⚪ NOT EVALUATED" if "NOT EVALUATED" in stat else "🔴 FAIL")
                 v_rows.append({
                     "Asset Label": v.get("label"),
                     "Placement": v.get("placement"),
                     "Visual Present": "✅ Yes" if v.get("visual_present") else "❌ No",
-                    "Status": badge,
+                    "Status": v_badge,
                 })
             st.dataframe(v_rows, use_container_width=True, hide_index=True)
 
-    # Tab 3: Methodology & Math Logic
-    with tab3:
-        st.subheader("Methodology, Scientometrics & Software Reproducibility")
+    # Tab 4: Methodology & Theory Logic
+    with tab4:
+        st.subheader("Methodology, Theoretical Framework & Reproducibility")
         meth = audit.get("methodology_and_math_logic", {})
-        mc1, mc2 = st.columns(2)
-        mc1.metric("Sample Size Accounting", meth.get("sample_size_check", "N/A"))
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Theoretical Framework", "✅ Present" if meth.get("theoretical_framework_present") else "❌ Missing / Unclear")
+        mc2.metric("Sample Size Accounting", meth.get("sample_size_check", "N/A"))
         missing = meth.get("missing_domain_metrics", [])
-        mc2.write("**Missing Domain-Specific Metrics (Scientometrics):**")
+        mc3.write("**Missing Domain Metrics:**")
         if missing:
             for m in missing:
-                mc2.markdown(f"- ⚠️ `{m}`")
+                mc3.markdown(f"- ⚠️ `{m}`")
         else:
-            mc2.write("✅ All standard metrics detected or study is non-bibliometric.")
+            mc3.write("✅ None identified as missing.")
         st.info(f"**Software Reproducibility & Parameter Notes:**\n\n{meth.get('software_reproducibility_notes', 'None recorded.')}")
 
-    # Tab 4: OpenAlex Reviewers
-    with tab4:
-        st.subheader("OpenAlex Peer Reviewer Discovery")
-        st.caption("Verified candidate profiles in regional academic institutions.")
+    # Tab 5: OpenAlex Reviewers
+    with tab5:
+        st.subheader("OpenAlex Verified Peer Reviewer Discovery")
+        st.caption("Matched against candidate profiles in verified regional institutions.")
         for region, cands in reviewers.items():
             st.markdown(f"### Region: {region}")
             if not cands or "error" in cands[0]:
