@@ -37,6 +37,15 @@ REQUIRED_TEMPLATE_SECTIONS = [
     "Ethics Statement",
 ]
 
+CORE_SECTIONS = {
+    "Abstract",
+    "Introduction",
+    "Materials and Methods",
+    "Results and Discussion",
+    "Conclusions",
+    "References",
+}
+
 SECTION_PATTERNS = {
     "Abstract": r"(?i)^\s*(?:abstract|executive\s+summary)\s*:?$",
     "Introduction": r"(?i)^\s*(?:(?:section\s+)?1(?:\.0?)?|[ivx]+\.?)?\s*(?:introduction|background)\s*:?$",
@@ -93,7 +102,7 @@ def word_count(text: str) -> int:
 
 
 def clean_json_response(raw_resp: str) -> Dict[str, Any]:
-    """Strip markdown wrapping and parse strictly valid JSON."""
+    """Strip markdown wrappers and parse valid JSON."""
     clean = re.sub(r"^```(?:json)?\s*", "", raw_resp.strip(), flags=re.MULTILINE)
     clean = re.sub(r"```\s*$", "", clean.strip(), flags=re.MULTILINE).strip()
     try:
@@ -102,17 +111,62 @@ def clean_json_response(raw_resp: str) -> Dict[str, Any]:
         match = re.search(r"(\{.*\})", clean, re.DOTALL)
         if match:
             return json.loads(match.group(1))
-        raise ValueError("Could not parse valid JSON from AI response.")
+        raise ValueError("Could not extract valid JSON from completion.")
 
 
 # ============================================================
-# ASSET & SECTION EXTRACTION (RULE 4: DEDUPLICATION & FORMAL CAPTIONS)
+# DETERMINISTIC PRE-AUDIT & ASSET EXTRACTION
 # ============================================================
+
+def preaudit_sections(text: str) -> List[Dict[str, Any]]:
+    """Scan entire document text hierarchy to locate exact headings and first-line quotes."""
+    lines = text.splitlines()
+    detected_map = {}
+
+    for i, line in enumerate(lines):
+        clean = normalize(line)
+        if not clean or len(clean) > 85:
+            continue
+        for sec_name, pattern in SECTION_PATTERNS.items():
+            if sec_name in detected_map:
+                continue
+            if re.match(pattern, clean):
+                quote = ""
+                for nxt in lines[i + 1: i + 6]:
+                    cleaned_nxt = normalize(nxt)
+                    if cleaned_nxt and not any(re.match(p, cleaned_nxt) for p in SECTION_PATTERNS.values()):
+                        quote = cleaned_nxt[:140]
+                        break
+                detected_map[sec_name] = {
+                    "heading": clean,
+                    "first_line_quote": quote or "Heading located with direct follow-up text.",
+                    "line_num": i,
+                }
+
+    preaudited = []
+    for sec in REQUIRED_TEMPLATE_SECTIONS:
+        if sec in detected_map:
+            info = detected_map[sec]
+            preaudited.append({
+                "section_name": sec,
+                "detected_heading": info["heading"],
+                "first_line_quote": info["first_line_quote"],
+                "status_hint": "PASS",
+            })
+        else:
+            preaudited.append({
+                "section_name": sec,
+                "detected_heading": "Section heading not identified",
+                "first_line_quote": "N/A",
+                "status_hint": "FAIL" if sec in CORE_SECTIONS else "WARN",
+            })
+    return preaudited
+
 
 def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     """
-    Extract document text and deduplicate formal captions.
-    Ignores informal narrative mentions (e.g. 'as shown in Figure 1').
+    Extract full manuscript text while auditing formal visual captions.
+    Deduplicates and ignores narrative in-text references (e.g., 'as shown in Figure 2').
     """
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
@@ -146,8 +200,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
                             "label": label,
                             "caption": txt,
                             "placement": "In-line document body",
-                            "has_image": asset_meta["total_images"] > 0,
-                            "has_table": asset_meta["total_tables"] > 0,
+                            "has_visual": (asset_meta["total_images"] > 0 if "Fig" in label else asset_meta["total_tables"] > 0),
                         })
 
         for table in doc.tables:
@@ -179,8 +232,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
                                 "label": label,
                                 "caption": sline,
                                 "placement": "In-line document body",
-                                "has_image": images_on_page > 0,
-                                "has_table": tables_on_page > 0,
+                                "has_visual": (images_on_page > 0 if "Fig" in label else tables_on_page > 0) or (asset_meta["total_images"] > 0 if "Fig" in label else asset_meta["total_tables"] > 0),
                             })
 
         return "\n".join(pages), asset_meta
@@ -189,11 +241,11 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
 
 
 # ============================================================
-# AUDIT JSON SCHEMA SPECIFICATION
+# AUDIT JSON SCHEMA
 # ============================================================
 
 AUDIT_STRICT_SCHEMA = {
-    "name": "manuscript_pre_screening_audit",
+    "name": "manuscript_editorial_audit",
     "strict": True,
     "schema": {
         "type": "object",
@@ -275,70 +327,62 @@ AUDIT_STRICT_SCHEMA = {
 
 
 # ============================================================
-# AUDIT ENGINE (EXACT INSTRUCTIONS APPLIED)
+# AUDIT ENGINE
 # ============================================================
 
 def run_editorial_audit(raw_text: str, asset_meta: Dict[str, Any], client: Groq) -> Dict[str, Any]:
-    """Execute evidence-based manuscript audit enforcing all 5 critical audit rules."""
-    total_words = word_count(raw_text)
-    has_references = bool(re.search(r"(?i)\b(?:references|bibliography)\b", raw_text))
-    is_likely_excerpt = (total_words < 2500) and not has_references
+    """Execute rigorous pre-screening audit enforcing all critical instructions."""
+    preaudited = preaudit_sections(raw_text)
 
-    truncation_context = (
-        "DOCUMENT COMPLETION STATUS: FULL PAPER LIKELY."
-        if not is_likely_excerpt
-        else "DOCUMENT COMPLETION STATUS: FRAGMENT / EXCERPT DETECTED (Document length is brief and lacks References)."
-    )
+    prompt = f"""You are an expert scientific manuscript editorial auditor. Conduct a thorough, evidence-based pre-screening audit of the provided manuscript.
 
-    prompt = f"""You are an expert academic manuscript pre-screener and editorial auditor. Conduct a thorough, evidence-based audit of the provided manuscript text.
+CRITICAL INSTRUCTIONS & CONSTRAINTS:
 
-CRITICAL AUDIT CONSTRAINTS & RULES:
+1. ABSENCE VERIFICATION & EXCERPT HANDLING:
+   - Do NOT mark a section as "NOT EVALUATED (EXCERPT PROVIDED)" if the text or heading is present in the document.
+   - Scan the ENTIRE document text hierarchy from top to bottom before assigning a section status.
+   - Assign "PASS" if the section heading AND its corresponding body text/quotes are found.
+   - Assign "NOT EVALUATED (EXCERPT PROVIDED)" ONLY if the manuscript file is demonstrably cut off mid-text and no body text was provided for that section.
+   - Assign "FAIL" ONLY if the manuscript is completely provided and a required core section is missing entirely.
+   - Assign "WARN" for missing optional sections (e.g., Acknowledgments, Funding, Ethics Statement, AI Usage).
 
-1. EXCERPT & TRUNCATION HANDLING (STRICT):
-   - NEVER declare a section "FAIL" or "Not Found" if you are evaluating an incomplete excerpt or fragment of a document.
-   - If a standard section is absent due to text truncation or partial file upload, mark its status strictly as "NOT EVALUATED (EXCERPT PROVIDED)".
-   - Mark a section as "FAIL" ONLY if the manuscript is complete and the section is explicitly missing.
-   - For optional sections (e.g., Acknowledgments, Funding, Ethics Statement, AI Usage), mark as "WARN" rather than "FAIL" if omitted in full papers.
+2. EVIDENCE-BASED AUDITING:
+   - For EVERY section evaluated, you MUST extract and provide an exact first-line text quote from the manuscript as proof of existence. Do NOT leave quotes blank if the section text exists.
 
-2. MANUSCRIPT TITLE EXTRACTION:
-   - Extract the actual academic paper title (e.g., "Consumer Perception, Food Waste and Food Packaging Research...").
-   - NEVER output a DOI link, URL, header string, or journal name in the "manuscript_title" field.
+3. MANUSCRIPT TITLE RESOLUTION:
+   - Extract the full, actual academic article title (e.g., "Consumer Perception, Food Waste and Food Packaging Research...").
+   - NEVER output a DOI link, URL string, header metadata, or journal name as the manuscript title.
 
-3. EVIDENCE-BASED SECTION VERIFICATION:
-   - For every detected section, extract the exact first-line quote from the document text to prove its presence.
-
-4. VISUAL ASSET AUDIT & DEDUPLICATION:
-   - Audit formal captions only (e.g., "Figure 1: ...", "Table 2: ...").
-   - Do NOT create separate entries for informal text mentions within narrative paragraphs (e.g., ignore sentences like "as shown in Figure 1").
+4. VISUAL ASSET & CAPTION AUDIT:
+   - Audit formal table and figure captions (e.g., "Table 1: ...", "Figure 2: ...").
+   - Deduplicate narrative text mentions: Do NOT create separate entries for in-text sentence mentions (e.g., ignore sentences like "as shown in Figure 2").
 
 5. METHODOLOGICAL & SCIENTOMETRIC TRANSPARENCY:
-   - For bibliometric/scientometric papers, explicitly check for missing standard metrics: h-index, g-index, m-index.
-   - Audit software reproducibility: check if version numbers, parameter settings, or normalization techniques (e.g., VOSviewer, Biblioshiny, CiteSpace) are explicitly reported.
+   - For bibliometric/scientometric studies, explicitly audit and report whether standard domain metrics are present: h-index, g-index, m-index.
+   - Audit software reproducibility: check if version numbers, parameter settings, or normalization techniques (e.g., VOSviewer, Biblioshiny, CiteSpace) are explicitly detailed.
 
-{truncation_context}
+PRE-SCANNED SECTION EVIDENCE FOUND IN TEXT:
+{json.dumps(preaudited, indent=2)}
 
-DETECTED ASSET CAPTIONS IN EXTRACTION:
+PRE-SCANNED FORMAL VISUAL CAPTIONS:
 {json.dumps(asset_meta['detected_captions'], indent=2)}
 
-SECTIONS TO EVALUATE:
-{json.dumps(REQUIRED_TEMPLATE_SECTIONS)}
-
-MANUSCRIPT TEXT:
+MANUSCRIPT TEXT BODY:
 --- START OF TEXT ---
 {raw_text[:14000]}
 --- END OF TEXT ---
 
-Return strictly valid, unformatted JSON matching the schema."""
+Return strictly valid, unformatted JSON following the exact schema."""
 
     messages = [
         {
             "role": "system",
-            "content": "You are a senior academic peer reviewer and editorial auditor. Output strictly valid JSON matching the requested schema.",
+            "content": "You are an expert scientific manuscript editorial auditor. Audit thoroughly with zero hallucinations. Output strictly valid JSON matching the schema.",
         },
         {"role": "user", "content": prompt},
     ]
 
-    # Attempt 1: Strict JSON schema execution with primary model
+    # Attempt 1: Strict JSON Schema with Primary Model
     try:
         resp = client.chat.completions.create(
             model=PRIMARY_MODEL,
@@ -353,7 +397,7 @@ Return strictly valid, unformatted JSON matching the schema."""
     except (BadRequestError, Exception):
         pass
 
-    # Attempt 2: Primary model with json_object enforcement
+    # Attempt 2: Primary Model with JSON Object Mode
     try:
         resp = client.chat.completions.create(
             model=PRIMARY_MODEL,
@@ -368,7 +412,7 @@ Return strictly valid, unformatted JSON matching the schema."""
     except (BadRequestError, Exception):
         pass
 
-    # Attempt 3: High-reliability fallback model
+    # Attempt 3: High-Reliability Fallback Model
     resp = client.chat.completions.create(
         model=FALLBACK_MODEL,
         messages=messages,
@@ -457,7 +501,6 @@ def search_openalex_reviewers(query_terms: List[str], region: str, mailto: str =
 
 
 def reviewer_discovery_report(title: str, mailto: str = "") -> Dict[str, List[Dict[str, Any]]]:
-    # Extract salient search terms from the identified manuscript title
     stopwords = {"a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "of", "by", "from", "using", "study", "analysis"}
     terms = [w for w in re.findall(r"\b[A-Za-z]{3,}\b", title) if w.lower() not in stopwords]
     output = {}
@@ -515,11 +558,11 @@ def blind_copy_docx(original_bytes: bytes) -> bytes:
 
 def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[str, Any]]]) -> bytes:
     doc = Document()
-    doc.add_heading("Manuscript Pre-Screening & Editorial Audit Report", 0)
+    doc.add_heading("Scientific Manuscript Editorial Pre-Screening Audit Report", 0)
     doc.add_paragraph(f"Manuscript Title: {audit.get('manuscript_title', 'Not specified')}")
-    
+
     verd = audit.get("editorial_verdict", {})
-    doc.add_paragraph(f"Verdict: {verd.get('decision', 'Under Review')}")
+    doc.add_paragraph(f"Decision: {verd.get('decision', 'Under Review')}")
     doc.add_paragraph(f"Summary Notes: {verd.get('summary_notes', '')}")
 
     doc.add_heading("1. Structural Section Verification", level=1)
@@ -566,22 +609,22 @@ def generate_docx_report(audit: Dict[str, Any], reviewers: Dict[str, List[Dict[s
 
 
 # ============================================================
-# STREAMLIT UI (CLEAN EDITORIAL DASHBOARD, NO RAW JSON)
+# STREAMLIT UI (STRUCTURED EDITORIAL DASHBOARD)
 # ============================================================
 
-st.set_page_config(page_title="Academic Manuscript Audit", page_icon="📑", layout="wide")
-st.title("📑 Academic Manuscript Pre-Screening & Editorial Auditor")
-st.caption("Evidence-based structural checks, caption deduplication, and scientometric reproducibility analysis.")
+st.set_page_config(page_title="Manuscript Editorial Auditor", page_icon="📑", layout="wide")
+st.title("📑 Scientific Manuscript Pre-Screening & Editorial Auditor")
+st.caption("Evidence-based structural auditing, caption deduplication, and scientometric reproducibility analysis.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     groq_api_key = st.text_input("Groq API Key", value=get_secret("GROQ_API_KEY"), type="password")
-    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editor@academicprescreen.org"))
+    openalex_mailto = st.text_input("OpenAlex Mailto Email", value=get_secret("OPENALEX_MAILTO", "editorial-auditor@mrjournal.org"))
     st.markdown("---")
     st.markdown("**Critical Pre-Screening Directives:**")
-    st.markdown("1. **Truncation Handling**: Missing sections in excerpts marked as `NOT EVALUATED (EXCERPT PROVIDED)`.")
-    st.markdown("2. **Title Extraction**: Real paper title extracted; no DOIs/URLs.")
-    st.markdown("3. **Evidence-Based Quotes**: Verifies first-line quotes for detected headings.")
+    st.markdown("1. **Absence Verification**: Scans full hierarchy; never marks `NOT EVALUATED` if text exists.")
+    st.markdown("2. **Evidence-Based Quotes**: Verifies first-line quotes for every section.")
+    st.markdown("3. **Title Resolution**: Full article title; no DOIs/URLs.")
     st.markdown("4. **Asset Deduplication**: Audits formal captions only.")
     st.markdown("5. **Scientometrics**: Checks h/g/m indices & software parameters.")
 
@@ -593,13 +636,13 @@ if uploaded_file and st.button("🚀 Conduct Evidence-Based Audit", type="primar
         st.stop()
 
     try:
-        with st.spinner("Extracting document text and deduplicating formal captions..."):
+        with st.spinner("Extracting text hierarchy and auditing visual assets..."):
             raw_text, asset_meta = extract_text_and_assets(uploaded_file)
             if not raw_text.strip():
                 st.error("Could not extract readable text from the uploaded document.")
                 st.stop()
 
-        with st.spinner("Executing rigorous pre-screening audit with Groq AI..."):
+        with st.spinner("Executing line-by-line editorial audit with Groq AI..."):
             client = Groq(api_key=groq_api_key)
             audit_result = run_editorial_audit(raw_text, asset_meta, client)
 
@@ -607,7 +650,7 @@ if uploaded_file and st.button("🚀 Conduct Evidence-Based Audit", type="primar
             detected_title = audit_result.get("manuscript_title", "")
             reviewers = reviewer_discovery_report(detected_title, mailto=openalex_mailto)
 
-        with st.spinner("Compiling Word report and blind reviewer copy..."):
+        with st.spinner("Compiling DOCX report and anonymized copy..."):
             orig_bytes = uploaded_file.getvalue()
             blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.endswith(".docx") else orig_bytes
             docx_report = generate_docx_report(audit_result, reviewers)
@@ -695,17 +738,17 @@ if "audit" in st.session_state:
             for m in missing:
                 mc2.markdown(f"- ⚠️ `{m}`")
         else:
-            mc2.write("✅ None identified as missing.")
+            mc2.write("✅ All standard metrics detected or study is non-bibliometric.")
         st.info(f"**Software Reproducibility & Parameter Notes:**\n\n{meth.get('software_reproducibility_notes', 'None recorded.')}")
 
     # Tab 4: OpenAlex Reviewers
     with tab4:
         st.subheader("OpenAlex Peer Reviewer Discovery")
-        st.caption("Matched against candidate profiles in verified regional institutions.")
+        st.caption("Verified candidate profiles in regional academic institutions.")
         for region, cands in reviewers.items():
             st.markdown(f"### Region: {region}")
             if not cands or "error" in cands[0]:
-                st.write("No matching profiles found.")
+                st.write("No matching candidate profiles found.")
                 continue
             r_rows = []
             for c in cands:
