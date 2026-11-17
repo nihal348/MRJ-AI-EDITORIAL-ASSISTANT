@@ -4,7 +4,7 @@ import os
 import re
 import time
 from statistics import median
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pdfplumber
 import requests
@@ -129,27 +129,55 @@ NON_TAXON_ABBREVS = {
     "fig", "tab", "vol", "no", "pp", "eq", "et", "vs", "al", "ca", "approx",
 }
 
-NORTHEAST_STATES = {
-    "assam", "arunachal pradesh", "manipur", "meghalaya", "mizoram", "nagaland", "sikkim", "tripura"
-}
-
-NORTHEAST_INSTITUTION_TERMS = [
-    "iit guwahati", "tezu university", "tezpur university", "nit silchar", "assam university",
-    "gauhati university", "cotton university", "dibrugarh university", "nehu",
-    "north-eastern hill university", "nit agartala", "manipur university",
-    "mizoram university", "nagaland university", "tripura university", "rajiv gandhi university",
-    "sikkim university", "arunachal university",
-]
-
 ASSAM_TERMS = [
-    "assam", "iit guwahati", "gauhati university", "cotton university", "dibrugarh university",
-    "assam university", "tezpur university", "nit silchar", "indian institute of technology guwahati",
+    "assam", "guwahati", "gauhati", "tezpur", "silchar", "dibrugarh", "jorhat",
+    "diphu", "kokrajhar", "lakhimpur", "nagaon", "barpeta", "bongaigaon", "tinsukia",
+    "sivasagar", "sonitpur", "kamrup", "iit guwahati", "indian institute of technology guwahati",
+    "gauhati university", "cotton university", "dibrugarh university", "assam university",
+    "tezpur university", "nit silchar", "national institute of technology silchar",
+    "assam agricultural university", "assam down town university", "assam don bosco",
+    "kaziranga university", "bodoland university", "krishna kanta handiqui",
+    "csir-neist", "north east institute of science and technology", "iasst",
+    "iiit guwahati", "aiims guwahati", "assam engineering college",
 ]
+
+NORTHEAST_NON_ASSAM_TERMS = [
+    "arunachal pradesh", "itanagar", "nerist", "nit arunachal", "rajiv gandhi university",
+    "manipur", "imphal", "manipur university", "nit manipur", "cau imphal", "central agricultural university",
+    "meghalaya", "shillong", "nehu", "north-eastern hill university", "north eastern hill university",
+    "nit meghalaya", "iim shillong", "ri-bhoi",
+    "mizoram", "aizawl", "mizoram university", "nit mizoram",
+    "nagaland", "kohima", "dimapur", "lumami", "nagaland university", "nit nagaland",
+    "sikkim", "gangtok", "tadong", "sikkim university", "nit sikkim", "sikkim manipal",
+    "tripura", "agartala", "tripura university", "nit agartala", "mbb university",
+]
+
+NORTHEAST_ALL_TERMS = list(set(ASSAM_TERMS + NORTHEAST_NON_ASSAM_TERMS))
 
 GENERIC_INST_TOKENS = {
     "university", "institute", "college", "school", "department", "dept", "centre", "center",
     "research", "technology", "science", "sciences", "engineering", "national", "indian",
     "state", "central", "of", "and", "for", "the", "in", "at", "india",
+}
+
+ACADEMIC_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "with", "of",
+    "by", "from", "using", "use", "used", "study", "studies", "analysis", "analyze",
+    "analysed", "analyzed", "approach", "approaches", "based", "case", "india", "indian",
+    "paper", "research", "results", "result", "method", "methods", "methodology",
+    "data", "dataset", "datasets", "model", "models", "proposed", "propose", "present",
+    "presents", "presented", "show", "shows", "showed", "shown", "finding", "findings",
+    "conclusion", "conclusions", "significant", "significantly", "observed", "observe",
+    "between", "among", "across", "within", "through", "into", "over", "under", "high",
+    "low", "higher", "lower", "increase", "increased", "decrease", "decreased", "different",
+    "various", "several", "two", "three", "four", "five", "also", "however", "therefore",
+    "thus", "moreover", "furthermore", "whereas", "while", "during", "well", "new",
+    "novel", "effective", "efficient", "performance", "evaluation", "evaluate", "evaluated",
+    "compared", "comparison", "investigate", "investigated", "examine", "examined",
+    "determine", "determined", "assess", "assessed", "assessment", "impact", "effect",
+    "effects", "role", "factors", "factor", "level", "levels", "rate", "rates", "area",
+    "areas", "region", "regions", "regional", "state", "district", "districts", "sample",
+    "samples", "values", "value", "table", "figure", "abstract", "keywords",
 }
 
 
@@ -229,7 +257,6 @@ def _extract_docx_textbox_texts(element) -> List[str]:
 
 
 def _scan_unitalicized_binomials_in_para(para: Paragraph) -> List[str]:
-    """Detects abbreviated taxonomic binomials like 'E. coli' in .docx runs lacking italicization."""
     flags = []
     full_txt = para.text or ""
     if not full_txt.strip():
@@ -240,7 +267,6 @@ def _scan_unitalicized_binomials_in_para(para: Paragraph) -> List[str]:
     if not matches:
         return flags
 
-    # Build char-level italic map across runs
     italic_map = []
     for run in para.runs:
         r_txt = run.text or ""
@@ -298,7 +324,6 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
         xml_text = doc._element.xml
         asset_meta["total_images"] = len(re.findall(r"<a:blip|<w:drawing", xml_text))
 
-        # Iterate body elements in TRUE reading order
         table_idx = 0
         for child in doc.element.body.iterchildren():
             if isinstance(child, CT_P):
@@ -313,7 +338,6 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
                     )
                 asset_meta["unitalicized_taxa_xml"].extend(_scan_unitalicized_binomials_in_para(p))
 
-                # Also extract any captions inside embedded text boxes
                 for tb_line in _extract_docx_textbox_texts(child):
                     parts.append(tb_line)
                     is_fig = bool(re.match(r"^\s*(?:Fig|Figure)", tb_line, re.I))
@@ -348,7 +372,7 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     elif name.endswith(".pdf"):
         pages = []
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for p_num, page in enumerate(pdf.pages, start=1):
+            for page in pdf.pages:
                 page_text = page.extract_text() or ""
                 pages.append(page_text)
                 images_on_page = len(page.images)
@@ -381,7 +405,6 @@ def extract_text_and_assets(uploaded_file) -> Tuple[str, Dict[str, Any]]:
     else:
         raise ValueError("Unsupported format. Please upload a .docx or .pdf file.")
 
-    # Cross-check in-text Figure & Table references across the FULL manuscript
     fig_refs = sorted(set(re.findall(r"\b(?:Figure|Fig\.?)\s+(\d+[A-Za-z]?)\b", full_text, re.I)))
     tab_refs = sorted(set(re.findall(r"\bTable\s+(\d+[A-Za-z]?)\b", full_text, re.I)))
     asset_meta["in_text_figure_refs"] = [f"Figure {x}" for x in fig_refs]
@@ -419,7 +442,6 @@ def split_manuscript_into_sections(text: str) -> Tuple[Dict[str, str], Dict[str,
         sec_name = _match_section_heading(clean)
         if sec_name and sec_name not in detected_map:
             quote = ""
-            # Check inline content first
             if sec_name in INLINE_SECTION_PREFIXES:
                 m_in = re.match(INLINE_SECTION_PREFIXES[sec_name], clean)
                 if m_in:
@@ -437,7 +459,6 @@ def split_manuscript_into_sections(text: str) -> Tuple[Dict[str, str], Dict[str,
             }
             ordered_hits.append((i, sec_name, clean))
 
-    # Implicit abstract check if no explicit Abstract heading found
     if "Abstract" not in detected_map:
         intro_line = detected_map.get("Introduction", {}).get("line_num", len(lines))
         search_limit = min(len(lines), intro_line, 55)
@@ -457,7 +478,6 @@ def split_manuscript_into_sections(text: str) -> Tuple[Dict[str, str], Dict[str,
                 ordered_hits.sort(key=lambda x: x[0])
                 break
 
-    # Build slices by section boundaries
     sections_text: Dict[str, str] = {}
     if ordered_hits:
         first_idx = ordered_hits[0][0]
@@ -473,30 +493,27 @@ def split_manuscript_into_sections(text: str) -> Tuple[Dict[str, str], Dict[str,
 
 
 def extract_author_metadata_deterministic(front_matter: str, full_text: str) -> Dict[str, List[str]]:
-    """Extracts probable author names and institutional affiliations to enforce COI exclusion."""
     lines = [normalize(l) for l in front_matter.splitlines() if normalize(l)]
     affiliations: List[str] = []
     authors: List[str] = []
 
     inst_regex = re.compile(
-        r"(?i)\b(university|institute|college|iit|nit|school of|department of|faculty of|academy|laboratory|centre for|center for)\b"
+        r"(?i)\b(university|institute|college|iit|nit|iiit|aiims|school of|department of|faculty of|academy|laboratory|centre for|center for)\b"
     )
     meta_noise_regex = re.compile(
-        r"(?i)^(received|accepted|published|issn|doi|keywords|correspondence|running title|abstract)"
+        r"(?i)^(received|accepted|published|issn|doi|keywords|correspondence|running title|abstract|original\s+(?:research\s+)?article|research\s+paper)"
     )
 
     for idx, line in enumerate(lines):
         if meta_noise_regex.match(line):
             continue
         if inst_regex.search(line):
-            # Split multi-affiliation lines separated by ';' or numbers
             chunks = re.split(r"\s*;\s*|\s*\d+\s*(?=[A-Z])", line)
             for ch in chunks:
                 ch_clean = normalize(ch).strip(" ,.;:*†1234567890")
                 if len(ch_clean) >= 6 and inst_regex.search(ch_clean):
                     affiliations.append(ch_clean)
         elif idx > 0 and word_count(line) <= 22 and not re.search(r"@|\d{4}|http", line):
-            # Likely author line right after title
             if "," in line or " and " in line.lower() or idx <= 3:
                 cleaned_line = re.sub(r"[*†‡§\d]+", "", line)
                 for cand in re.split(r"\s*,\s*|\s+and\s+", cleaned_line, flags=re.I):
@@ -504,8 +521,7 @@ def extract_author_metadata_deterministic(front_matter: str, full_text: str) -> 
                     if 2 <= word_count(c) <= 5 and not inst_regex.search(c):
                         authors.append(c)
 
-    # Also capture explicit corresponding author / affiliation lines anywhere in first 50 lines
-    for line in full_text.splitlines()[:50]:
+    for line in full_text.splitlines()[:60]:
         if re.search(r"(?i)corresponding author|affiliation", line) and inst_regex.search(line):
             affiliations.append(normalize(line))
 
@@ -569,12 +585,10 @@ def scan_scholarly_and_statistical_signals(text: str, asset_meta: Dict[str, Any]
         "unitalicized_taxa_xml": asset_meta.get("unitalicized_taxa_xml", []),
     }
 
-    # 1. Improper p-values (p = 0.00, p = 0, p = .000)
     p_zero = re.findall(r"(?i)\bp(?:\s*-?\s*value)?\s*(?:=|is)\s*0?(?:\.0+)?(?!\d)", text)
     if p_zero:
         signals["improper_p_values_detected"] = sorted(set(normalize(m) for m in p_zero))
 
-    # 2. Symmetric vs directional statistical fallacy (Pearson correlation + dependent/independent variable)
     sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
     for idx, sent in enumerate(sentences):
         window = " ".join(sentences[max(0, idx - 1): min(len(sentences), idx + 2)])
@@ -583,7 +597,6 @@ def scan_scholarly_and_statistical_signals(text: str, asset_meta: Dict[str, Any]
         ):
             signals["pearson_directional_fallacy_hits"].append(normalize(sent)[:200])
 
-        # 3. Pseudoreplication context (pixel/voxel/technical replicate near inferential test)
         if re.search(r"(?i)\b(?:pixels?|voxels?|technical\s+replicates?|sub-?samples?)\b", window) and re.search(
             r"(?i)\b(?:anova|t-?test|chi-?square|χ²|p\s*[<>=]|degrees?\s+of\s+freedom)\b", sent
         ):
@@ -592,19 +605,16 @@ def scan_scholarly_and_statistical_signals(text: str, asset_meta: Dict[str, Any]
     signals["pearson_directional_fallacy_hits"] = signals["pearson_directional_fallacy_hits"][:5]
     signals["pseudoreplication_context_hits"] = signals["pseudoreplication_context_hits"][:5]
 
-    # 4. Pejorative / imprecise academic terms
     for pat in PEJORATIVE_OR_IMPRECISE_TERMS:
         for m in re.findall(pat, text, flags=re.I):
             signals["pejorative_terms_detected"].append(normalize(m))
     signals["pejorative_terms_detected"] = sorted(set(signals["pejorative_terms_detected"]))
 
-    # 5. Old Census / dataset years
     old_ds = re.findall(r"(?i)\b(?:census\s+(?:of\s+)?(19\d{2}|200\d|201[0-5])|(19\d{2}|200\d|201[0-5])\s+census)\b", text)
     flat_ds = [y for tup in old_ds for y in tup if y]
     if flat_ds:
         signals["old_dataset_years_detected"] = sorted(set(flat_ds))
 
-    # 6. Obvious concatenation / common spelling glitches
     concat_hits = re.findall(r"\b[a-z]{4,}[A-Z]{2,}[A-Za-z]*\b", text)
     spell_hits = re.findall(r"(?i)\b(?:dimentional|reasearch|signficant|enviroment|analaysis|methdology)\b", text)
     signals["typo_concatenation_hits"] = sorted(set(concat_hits[:8] + spell_hits[:8]))
@@ -636,16 +646,15 @@ def preaudit_mrj_template(
             if re.match(t_pattern, clean) and clean not in detected_thesis_headers:
                 detected_thesis_headers.append(clean)
 
-    # Accurate Abstract Word Count (captures full abstract up to Keywords / Introduction)
-    abstract_text = sections_text.get("Abstract", "")
-    if abstract_text:
-        abs_clean = re.sub(r"(?is)^\s*abstract\s*[:.\-—]?\s*", "", abstract_text)
-        abs_clean = re.split(r"(?im)^\s*keywords?\s*[:\-—]", abs_clean)[0]
+    abstract_raw = sections_text.get("Abstract", "")
+    if abstract_raw:
+        abs_clean = re.sub(r"(?is)^\s*(?:abstract|executive\s+summary)\s*[:.\-—]?\s*", "", abstract_raw)
+        abs_clean = re.split(r"(?im)^\s*keywords?\s*[:\-—]", abs_clean)[0].strip()
         abstract_wc = word_count(abs_clean)
     else:
+        abs_clean = ""
         abstract_wc = 0
 
-    # Keywords detection
     keywords_detected: List[str] = []
     m_kw = re.search(
         r"(?is)\bkeywords?\s*[:\-—]\s*(.*?)(?=\n\s*(?:(?:\d+\.?\s+)?introduction|materials|data\s+and\s+methods|abstract)\b|$)",
@@ -655,7 +664,6 @@ def preaudit_mrj_template(
         raw_kw = m_kw.group(1).strip().splitlines()[0]
         keywords_detected = [normalize(k) for k in re.split(r"[;,]", raw_kw) if len(normalize(k)) > 1]
 
-    # Multidisciplinary Domains parser (supports comma-less "(a) X (b) Y and (c) Z" lists)
     dom_found = False
     dom_items: List[str] = []
     dom_section = sections_text.get("Multidisciplinary Domains", "")
@@ -683,6 +691,7 @@ def preaudit_mrj_template(
     author_meta = extract_author_metadata_deterministic(sections_text.get("FrontMatter", ""), text)
 
     template_observations: Dict[str, Any] = {
+        "abstract_text": abs_clean,
         "abstract_word_count": abstract_wc,
         "keywords_detected": keywords_detected,
         "multidisciplinary_domains_found": dom_found,
@@ -734,6 +743,7 @@ AUDIT_STRICT_SCHEMA = {
             "manuscript_title": {"type": "string"},
             "extracted_authors": {"type": "array", "items": {"type": "string"}},
             "extracted_affiliations": {"type": "array", "items": {"type": "string"}},
+            "reviewer_search_queries": {"type": "array", "items": {"type": "string"}},
             "editorial_verdict": {
                 "type": "object",
                 "properties": {
@@ -884,6 +894,7 @@ AUDIT_STRICT_SCHEMA = {
             "manuscript_title",
             "extracted_authors",
             "extracted_affiliations",
+            "reviewer_search_queries",
             "editorial_verdict",
             "pass_1_cross_section_integrity",
             "pass_2_template_and_layout",
@@ -933,14 +944,12 @@ def call_groq_json(
                 return clean_json_response(resp.choices[0].message.content or "{}")
 
             except BadRequestError:
-                # Schema rejection or unsupported param -> retry same model with json_object
                 if attempt == 0 and schema:
                     continue
                 break
             except Exception as err:
                 err_str = str(err).lower()
                 if "429" in err_str or "rate" in err_str or "tokens per minute" in err_str:
-                    # Polite TPM backoff on Free Tier
                     wait_sec = 12 * (attempt + 1)
                     time.sleep(wait_sec)
                     continue
@@ -966,7 +975,6 @@ def run_editorial_audit(
 
     chunk_char_limit = 9500 if free_tier_mode else 45000
 
-    # Assemble logical manuscript segments WITHOUT losing any part of the text
     front_intro = "\n\n".join(
         s for s in [
             sections_text.get("FrontMatter", ""),
@@ -990,11 +998,9 @@ def run_editorial_audit(
     ).strip()
 
     if not body_methods_results and not front_intro:
-        # Fallback if headings were entirely unformatted
         body_methods_results = raw_text
         front_intro = raw_text[:6000]
     elif not body_methods_results:
-        # Take everything between Introduction and References
         body_methods_results = raw_text
 
     ground_truth_dossier = {
@@ -1017,9 +1023,6 @@ def run_editorial_audit(
         },
     }
 
-    # --------------------------------------------------------
-    # STAGE 1 (MAP): Front Matter, Abstract Claims, Intro & Domain Validity
-    # --------------------------------------------------------
     if progress_cb:
         progress_cb("Stage 1/3: Auditing Front Matter, Abstract Claims, Authors & Conceptual Framing...")
 
@@ -1028,9 +1031,10 @@ def run_editorial_audit(
     for idx, f_chunk in enumerate(front_chunks):
         s1_prompt = f"""Analyze this Front Matter / Abstract / Introduction / Declarations excerpt (Chunk {idx+1}/{len(front_chunks)}) for an academic manuscript audit.
 Return valid JSON with keys:
-- "manuscript_title": string
-- "authors": list of author names found
-- "affiliations": list of author institutions/universities found
+- "manuscript_title": exact title of the manuscript
+- "authors": list of ALL author full names found
+- "affiliations": list of ALL author institutions/universities/departments found
+- "reviewer_search_queries": 4 to 6 crisp, domain-specific academic search queries (2 to 4 words each, NO punctuation, NO geographical places unless central to the topic) derived STRICTLY from the Manuscript Title and Abstract so we can locate peer reviewers working on this exact topic
 - "abstract_claimed_items": list of EVERY dataset, experiment, algorithm, method, variable, or organism claimed in the Abstract
 - "data_vintage_and_novelty_notes": check dataset years (e.g. 2011 Census analyzed in {CURRENT_YEAR}) and whether novelty is justified
 - "terminology_and_proxy_validity_flags": check for pejorative/imprecise terms (e.g. 'backwardness') and weak proxy variables (e.g. sex ratio alone as a primary development proxy instead of HDI/MPI/GII/IMR/safe drinking water)
@@ -1045,7 +1049,7 @@ EXCERPT:
                 {"role": "system", "content": "You are an expert academic peer-review auditor. Return strictly valid JSON."},
                 {"role": "user", "content": s1_prompt},
             ],
-            max_tokens=1800,
+            max_tokens=1900,
         )
         stage1_notes.append(s1_res)
         if free_tier_mode and idx < len(front_chunks) - 1:
@@ -1056,9 +1060,6 @@ EXCERPT:
         claimed_items.extend(n.get("abstract_claimed_items", []))
     claimed_items = list(dict.fromkeys(claimed_items))
 
-    # --------------------------------------------------------
-    # STAGE 2 (MAP): Full Methods, Results, Tables & Conclusions (Chunked — ZERO pages skipped)
-    # --------------------------------------------------------
     body_chunks = chunk_text(body_methods_results, max_chars=chunk_char_limit, overlap=800)
     stage2_notes = []
     for idx, b_chunk in enumerate(body_chunks):
@@ -1101,9 +1102,6 @@ CHUNK {idx+1}/{len(body_chunks)}:
         )
         stage2_notes.append(s2_res)
 
-    # --------------------------------------------------------
-    # STAGE 3 (REDUCE): Final 5-Pass Editorial Synthesis
-    # --------------------------------------------------------
     if progress_cb:
         progress_cb("Stage 3/3: Synthesizing 5-Pass Audit & Reconciling Ground-Truth Evidence...")
     if free_tier_mode:
@@ -1114,10 +1112,11 @@ Synthesize the Deterministic Ground-Truth Dossier, Stage 1 Front-Matter Audit, a
 
 CRITICAL GROUND-TRUTH RULES (DO NOT VIOLATE):
 1. NEVER mark a section as FAIL or 'not identified' if the Deterministic Dossier shows status_hint == 'PASS'.
-2. NEVER claim tables or figures are missing if the Visual Inventory shows them present. (e.g., if 7 tables and 4 figures are detected, acknowledge all of them!)
+2. NEVER claim tables or figures are missing if the Visual Inventory shows them present.
 3. NEVER mark 'multidisciplinary_domains_compliance' as FAIL if deterministic domains_count >= 2.
 4. For Pass 1: an Abstract claim is ONLY a discrepancy ('abstract_body_discrepancies') if it was NOT verified in ANY of the Stage 2 chunks!
-5. Include ALL statistical fallacies (Pearson dependent/independent error, pixel-level pseudoreplication, Chi-square contingency/df validity), domain/proxy critiques (2011 data vintage, 'backwardness' terminology, sex ratio proxy validity, raw Census table duplication), and biological/software critiques found across Stage 1 & 2.
+5. Include ALL statistical fallacies, domain/proxy critiques, and biological/software critiques found across Stage 1 & 2.
+6. In "reviewer_search_queries", provide 4 to 6 crisp 2–4 word academic search queries derived STRICTLY from the manuscript's Title and Abstract (for OpenAlex peer-reviewer search).
 
 DETERMINISTIC GROUND-TRUTH DOSSIER:
 {json.dumps(ground_truth_dossier, indent=2)}
@@ -1140,7 +1139,6 @@ Output strictly valid JSON complying with the schema."""
         max_tokens=4200,
     )
 
-    # Deterministic Post-LLM Reconciliation
     reconciled = reconcile_audit_with_ground_truth(audit_json, preaudited, detected_thesis, detected_placeholders, template_obs, asset_meta)
     return reconciled, preaudited, template_obs
 
@@ -1153,8 +1151,6 @@ def reconcile_audit_with_ground_truth(
     template_obs: Dict[str, Any],
     asset_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Programmatically prevents LLM hallucinations against verified deterministic evidence."""
-    # Merge extracted authors/affiliations with deterministic metadata
     det_auth = template_obs.get("author_metadata", {})
     audit["extracted_authors"] = list(dict.fromkeys(
         (audit.get("extracted_authors") or []) + det_auth.get("authors", [])
@@ -1163,7 +1159,6 @@ def reconcile_audit_with_ground_truth(
         (audit.get("extracted_affiliations") or []) + det_auth.get("affiliations", [])
     ))
 
-    # Pass 2 Reconciliation: Sections, Domains, Placeholders, Thesis headers, References
     p2 = audit.setdefault("pass_2_template_and_layout", {})
     llm_sec_map = {s.get("section_name"): s for s in p2.get("structural_section_checks", [])}
     fixed_sections = []
@@ -1196,7 +1191,6 @@ def reconcile_audit_with_ground_truth(
         (p2.get("template_placeholders_detected") or []) + detected_placeholders
     ))
 
-    # Reference currency deterministic note
     ref_cur = template_obs.get("reference_currency", {})
     if ref_cur.get("years_detected_count", 0) >= 5 and ref_cur.get("pct_older_than_10_yrs", 0) >= 65.0:
         ref_note = (
@@ -1208,7 +1202,6 @@ def reconcile_audit_with_ground_truth(
         if not any("median year" in n.lower() or "older" in n.lower() for n in p2_notes):
             p2_notes.append(ref_note)
 
-    # Pass 3 Reconciliation: Regex P-values, Pearson directional fallacy, Pseudoreplication triggers
     p3 = audit.setdefault("pass_3_statistical_and_mathematical_rigor", {})
     sigs = template_obs.get("scholarly_signals", {})
 
@@ -1235,7 +1228,6 @@ def reconcile_audit_with_ground_truth(
                 f"clarify independent observational unit. Context: \"{sigs['pseudoreplication_context_hits'][0]}\""
             )
 
-    # Pass 4 Reconciliation: Pejorative terminology, old dataset vintage
     p4 = audit.setdefault("pass_4_domain_and_reproducibility", {})
     if sigs.get("pejorative_terms_detected"):
         t_list = p4.setdefault("terminology_and_proxy_validity_flags", [])
@@ -1249,7 +1241,6 @@ def reconcile_audit_with_ground_truth(
         if not any(y in " ".join(v_list) for y in sigs["old_dataset_years_detected"]):
             v_list.append(f"Legacy secondary dataset detected (Census/dataset year: {yrs} evaluated in {CURRENT_YEAR}); justify incremental novelty and temporal relevance.")
 
-    # Pass 5 Reconciliation: Visual asset inventory & XML italics
     p5 = audit.setdefault("pass_5_literal_text_and_captions", {})
     if sigs.get("unitalicized_taxa_xml"):
         p5["taxonomic_formatting_flags"] = sorted(set(
@@ -1277,7 +1268,7 @@ def reconcile_audit_with_ground_truth(
 
 
 # ============================================================
-# COI-FILTERED OPENALEX REVIEWER DISCOVERY
+# COI-FILTERED OPENALEX REVIEWER DISCOVERY (STRICTLY BY TITLE & ABSTRACT)
 # ============================================================
 
 def _distinctive_tokens(inst_name: str) -> set:
@@ -1295,7 +1286,6 @@ def is_conflict_of_interest(
     cand_inst_norm = normalize(candidate_institution).lower()
     cand_inst_tokens = _distinctive_tokens(cand_inst_norm)
 
-    # 1. Author / Self-COI check
     for auth in excluded_authors:
         auth_norm = normalize(auth).lower()
         if not auth_norm:
@@ -1308,7 +1298,6 @@ def is_conflict_of_interest(
             if auth_parts[-1] == cand_parts[-1] and auth_parts[0][0] == cand_parts[0][0]:
                 return f"Probable author name match ({auth})"
 
-    # 2. Institutional COI check
     for inst in excluded_institutions:
         inst_norm = normalize(inst).lower()
         if not inst_norm:
@@ -1318,7 +1307,6 @@ def is_conflict_of_interest(
         inst_tokens = _distinctive_tokens(inst_norm)
         if inst_tokens and cand_inst_tokens:
             overlap = inst_tokens & cand_inst_tokens
-            # E.g. {"rajiv", "gandhi"} matches {"rajiv", "gandhi"} even if abbreviated ("Univ.")
             if overlap == inst_tokens or overlap == cand_inst_tokens or len(overlap) >= 2:
                 return f"Institutional COI ({inst})"
 
@@ -1326,156 +1314,592 @@ def is_conflict_of_interest(
 
 
 def openalex_get(url: str, params: Dict[str, Any], mailto: str = "") -> Dict[str, Any]:
+    req_params = dict(params)
     if mailto:
-        params = dict(params)
-        params["mailto"] = mailto
-    res = requests.get(url, params=params, timeout=25)
+        req_params["mailto"] = mailto
+    api_key = get_secret("OPENALEX_API_KEY")
+    if api_key:
+        req_params["api_key"] = api_key
+    res = requests.get(url, params=req_params, timeout=25)
     res.raise_for_status()
     return res.json()
 
 
-def candidate_region_match(candidate: Dict[str, Any], region: str) -> bool:
-    text = " ".join([
-        candidate.get("institution", ""),
-        candidate.get("city", ""),
-        candidate.get("region", ""),
-        candidate.get("country", ""),
-    ]).lower()
-
-    if region == "India":
-        return candidate.get("country", "").lower() == "in" or "india" in text
-    if region == "Northeast India":
-        return any(term in text for term in (set(NORTHEAST_STATES) | set(NORTHEAST_INSTITUTION_TERMS)))
-    if region == "Assam":
-        return any(term in text for term in ASSAM_TERMS)
-    return False
+def _sanitize_openalex_query(q: str) -> str:
+    cleaned = re.sub(r"[,:;()\[\]{}/\\]+", " ", q or "")
+    return normalize(cleaned)
 
 
-def search_openalex_by_query(
+def _reconstruct_openalex_abstract(inv_idx: Optional[Dict[str, List[int]]]) -> str:
+    if not inv_idx or not isinstance(inv_idx, dict):
+        return ""
+    pos_words: List[Tuple[int, str]] = []
+    for word, positions in inv_idx.items():
+        if isinstance(positions, list):
+            for p in positions:
+                pos_words.append((p, word))
+    pos_words.sort(key=lambda x: x[0])
+    return " ".join(w for _, w in pos_words)
+
+
+def _extract_title_abstract_profile(
+    title: str,
+    abstract_text: str,
+    extracted_keywords: List[str],
+    llm_search_queries: List[str],
+) -> Dict[str, Any]:
+    title_words = [
+        w.lower() for w in re.findall(r"\b[A-Za-z][A-Za-z\-]{2,}\b", title or "")
+        if w.lower() not in ACADEMIC_STOPWORDS
+    ]
+    abs_words = [
+        w.lower() for w in re.findall(r"\b[A-Za-z][A-Za-z\-]{2,}\b", abstract_text or "")
+        if w.lower() not in ACADEMIC_STOPWORDS
+    ]
+
+    # Frequency count across Title (weighted x3) and Abstract
+    freq: Dict[str, int] = {}
+    for w in title_words:
+        freq[w] = freq.get(w, 0) + 3
+    for w in abs_words:
+        freq[w] = freq.get(w, 0) + 1
+
+    # Significant bigrams from Title and Abstract
+    bigrams: Dict[str, int] = {}
+    for seq, weight in [(title_words, 3), (abs_words, 1)]:
+        for i in range(len(seq) - 1):
+            bg = f"{seq[i]} {seq[i+1]}"
+            bigrams[bg] = bigrams.get(bg, 0) + weight
+
+    top_terms = [k for k, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:18]]
+    top_bigrams = [k for k, v in sorted(bigrams.items(), key=lambda x: x[1], reverse=True) if v >= 2 or k in " ".join(title_words)][:8]
+
+    # Build crisp OpenAlex queries derived strictly from Title + Abstract + Keywords
+    queries: List[Tuple[str, str]] = []
+    seen_q: Set[str] = set()
+
+    def add_q(q_raw: str, label: str):
+        q_clean = _sanitize_openalex_query(q_raw)
+        if q_clean and len(q_clean.split()) >= 2 and q_clean.lower() not in seen_q:
+            seen_q.add(q_clean.lower())
+            queries.append((q_clean, label))
+
+    for lq in (llm_search_queries or [])[:6]:
+        add_q(lq, lq)
+
+    if len(title_words) >= 2:
+        add_q(" ".join(title_words[:4]), "Title Core Focus")
+    if len(top_terms) >= 3:
+        add_q(" ".join(top_terms[:3]), "Title & Abstract Core Terms")
+    for bg in top_bigrams[:3]:
+        add_q(bg, bg)
+    for kw in (extracted_keywords or [])[:4]:
+        add_q(kw, kw)
+    if not queries and title_words:
+        queries.append((title_words[0], title_words[0]))
+
+    return {
+        "title_terms": set(title_words),
+        "core_terms": set(top_terms),
+        "core_bigrams": set(top_bigrams),
+        "queries": queries[:7],
+    }
+
+
+def _score_work_against_profile(work: Dict[str, Any], profile: Dict[str, Any]) -> Tuple[int, List[str]]:
+    w_title = (work.get("display_name") or "").lower()
+    w_abs = _reconstruct_openalex_abstract(work.get("abstract_inverted_index")).lower()
+    w_topics = " ".join((t.get("display_name") or "") for t in (work.get("topics") or [])).lower()
+    combined = f"{w_title} {w_abs} {w_topics}"
+    work_tokens = set(re.findall(r"\b[a-z][a-z\-]{2,}\b", combined))
+
+    matched_terms: List[str] = []
+    score = 0
+
+    for t in profile["title_terms"]:
+        if t in work_tokens:
+            score += 3 if t in w_title else 2
+            matched_terms.append(t)
+
+    for t in profile["core_terms"]:
+        if t in work_tokens and t not in profile["title_terms"]:
+            score += 2 if t in w_title else 1
+            matched_terms.append(t)
+
+    for bg in profile["core_bigrams"]:
+        if bg in combined:
+            score += 4
+            if bg not in matched_terms:
+                matched_terms.append(bg)
+
+    return score, list(dict.fromkeys(matched_terms))[:6]
+
+
+def _classify_authorship_region(
+    inst_name: str,
+    country_code: str,
+    raw_affiliations: List[str],
+    geo_city: str = "",
+    geo_region: str = "",
+) -> Set[str]:
+    text = " ".join([inst_name, geo_city, geo_region, " ".join(raw_affiliations or [])]).lower()
+    regions: Set[str] = set()
+
+    is_assam = any(term in text for term in ASSAM_TERMS)
+    is_ne_other = any(term in text for term in NORTHEAST_NON_ASSAM_TERMS)
+    is_india = (country_code or "").lower() == "in" or "india" in text or is_assam or is_ne_other
+
+    if is_assam:
+        regions.add("Assam")
+        regions.add("Northeast India")
+    elif is_ne_other:
+        regions.add("Northeast India")
+    if is_india:
+        regions.add("India")
+    return regions
+
+
+def _fetch_openalex_works_for_region(
     query: str,
     region: str,
-    matched_topic: str,
-    excluded_authors: List[str],
-    excluded_institutions: List[str],
     mailto: str = "",
-) -> Tuple[List[Dict[str, Any]], int]:
-    if not query.strip():
-        return [], 0
+) -> List[Dict[str, Any]]:
+    year_cutoff = CURRENT_YEAR - 9
+    aff_filter = ""
+    per_page = 35
+
+    if region == "Assam":
+        aff_filter = ",raw_affiliation_strings.search:(Assam OR Guwahati OR Tezpur OR Silchar OR Dibrugarh OR Jorhat)"
+        per_page = 25
+    elif region == "Northeast India":
+        aff_filter = (
+            ",raw_affiliation_strings.search:(Meghalaya OR Shillong OR Manipur OR Imphal OR "
+            "Mizoram OR Aizawl OR Nagaland OR Kohima OR Tripura OR Agartala OR Sikkim OR "
+            "Gangtok OR Arunachal OR Itanagar OR NEHU)"
+        )
+        per_page = 25
+    else:
+        aff_filter = ",authorships.institutions.country_code:IN"
+        per_page = 40
+
+    # Tier 1: Strict Title + Abstract search on OpenAlex
     try:
         data = openalex_get(
             OPENALEX_URL,
-            {"search": query, "per-page": 30, "sort": "publication_year:desc"},
+            {
+                "filter": f"title_and_abstract.search:{query},publication_year:>{year_cutoff}{aff_filter}",
+                "per-page": per_page,
+            },
             mailto=mailto,
         )
+        results = data.get("results", [])
+        if results:
+            return results
     except Exception:
-        return [], 0
+        pass
 
-    candidates: Dict[str, Dict[str, Any]] = {}
-    coi_filtered_count = 0
-
-    for work in data.get("results", []):
-        year = work.get("publication_year") or 0
-        if year and year < CURRENT_YEAR - 8:
-            continue
-        title = work.get("display_name") or ""
-        doi = work.get("doi") or ""
-
-        for authorship in work.get("authorships", []):
-            author = authorship.get("author") or {}
-            author_id = author.get("id")
-            author_name = author.get("display_name")
-            if not author_id or not author_name:
-                continue
-
-            institutions = authorship.get("institutions") or []
-            for inst in institutions:
-                inst_name = inst.get("display_name") or "Unspecified Institution"
-                candidate = {
-                    "author_id": author_id,
-                    "name": author_name,
-                    "institution": inst_name,
-                    "country": inst.get("country_code") or "",
-                    "city": (inst.get("geo") or {}).get("city") or "",
-                    "region": (inst.get("geo") or {}).get("region") or "",
-                    "match_type": f"Specialist in {matched_topic}",
-                    "recent_pubs": [],
-                }
-                if not candidate_region_match(candidate, region):
-                    continue
-
-                if is_conflict_of_interest(author_name, inst_name, excluded_authors, excluded_institutions):
-                    coi_filtered_count += 1
-                    continue
-
-                if author_id not in candidates:
-                    candidates[author_id] = candidate
-                candidates[author_id]["recent_pubs"].append({"year": year, "title": title, "doi": doi})
-
-    return list(candidates.values()), coi_filtered_count
+    # Tier 2: Broad OpenAlex relevance search with the same geographic/year filter
+    try:
+        data = openalex_get(
+            OPENALEX_URL,
+            {
+                "search": query,
+                "filter": f"publication_year:>{year_cutoff}{aff_filter.lstrip(',')}",
+                "per-page": per_page,
+            },
+            mailto=mailto,
+        )
+        return data.get("results", [])
+    except Exception:
+        return []
 
 
 def reviewer_discovery_report(
     title: str,
+    abstract_text: str,
     extracted_keywords: List[str],
+    llm_search_queries: List[str],
     excluded_authors: List[str],
     excluded_institutions: List[str],
     mailto: str = "",
     max_per_region: int = 4,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
-    stopwords = {
-        "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "of",
-        "by", "from", "using", "study", "analysis", "approach", "based", "case", "india",
+    profile = _extract_title_abstract_profile(title, abstract_text, extracted_keywords, llm_search_queries)
+    search_queries = profile["queries"]
+
+    # Collect candidates per target region, scoring strictly against Title + Abstract
+    raw_pool: Dict[str, Dict[str, Dict[str, Any]]] = {
+        "Assam": {},
+        "Northeast India": {},
+        "India": {},
     }
-    title_terms = [w for w in re.findall(r"\b[A-Za-z]{3,}\b", title) if w.lower() not in stopwords]
-
-    search_queries: List[Tuple[str, str]] = []
-    if title_terms:
-        search_queries.append((" ".join(title_terms[:3]), "Manuscript Title Phrase"))
-    for kw in extracted_keywords[:4]:
-        if kw and len(kw) > 2:
-            search_queries.append((kw, kw))
-    for term in title_terms[:2]:
-        if term not in [sq[0] for sq in search_queries]:
-            search_queries.append((term, term))
-
-    output: Dict[str, List[Dict[str, Any]]] = {}
     total_coi_excluded = 0
 
-    for region in ["India", "Northeast India", "Assam"]:
-        region_candidates: Dict[str, Dict[str, Any]] = {}
-        for q_str, q_label in search_queries:
-            if len(region_candidates) >= max_per_region:
-                break
-            found, coi_cnt = search_openalex_by_query(
-                q_str,
-                region,
-                matched_topic=q_label,
-                excluded_authors=excluded_authors,
-                excluded_institutions=excluded_institutions,
-                mailto=mailto,
-            )
-            total_coi_excluded += coi_cnt
-            for cand in found:
-                aid = cand["author_id"]
-                if aid not in region_candidates:
-                    region_candidates[aid] = cand
-                else:
-                    region_candidates[aid]["recent_pubs"].extend(cand["recent_pubs"])
+    # Query Assam & NE first, plus India-wide (India-wide also feeds NE/Assam matches if present)
+    query_targets = [
+        ("Assam", "Assam"),
+        ("Northeast India", "Northeast India"),
+        ("India", "India"),
+    ]
 
-        results = list(region_candidates.values())
-        results.sort(key=lambda x: len(x["recent_pubs"]), reverse=True)
-        output[region] = results[:max_per_region]
+    for query_target_region, _ in query_targets:
+        for q_str, q_label in search_queries[:5]:
+            works = _fetch_openalex_works_for_region(q_str, query_target_region, mailto=mailto)
+            for work in works:
+                rel_score, matched_terms = _score_work_against_profile(work, profile)
+                # Require genuine Title/Abstract alignment
+                if rel_score < 3 or len(matched_terms) < 2:
+                    continue
+
+                year = work.get("publication_year") or 0
+                w_title = work.get("display_name") or ""
+                doi = work.get("doi") or ""
+
+                for authorship in work.get("authorships", []):
+                    author = authorship.get("author") or {}
+                    author_id = author.get("id")
+                    author_name = author.get("display_name")
+                    if not author_id or not author_name:
+                        continue
+
+                    raw_affs = authorship.get("raw_affiliation_strings") or []
+                    institutions = authorship.get("institutions") or []
+                    if not institutions and raw_affs:
+                        institutions = [{"display_name": raw_affs[0], "country_code": "IN", "geo": {}}]
+
+                    for inst in institutions:
+                        inst_name = inst.get("display_name") or (raw_affs[0] if raw_affs else "Unspecified Institution")
+                        geo = inst.get("geo") or {}
+                        matched_regions = _classify_authorship_region(
+                            inst_name=inst_name,
+                            country_code=inst.get("country_code") or "",
+                            raw_affiliations=raw_affs,
+                            geo_city=geo.get("city") or "",
+                            geo_region=geo.get("region") or "",
+                        )
+                        if not matched_regions:
+                            continue
+
+                        if is_conflict_of_interest(author_name, inst_name, excluded_authors, excluded_institutions):
+                            total_coi_excluded += 1
+                            continue
+
+                        pub_record = {
+                            "year": year,
+                            "title": w_title,
+                            "doi": doi,
+                            "relevance_score": rel_score,
+                            "matched_terms": matched_terms,
+                        }
+
+                        for reg in matched_regions:
+                            bucket = raw_pool[reg]
+                            if author_id not in bucket:
+                                bucket[author_id] = {
+                                    "author_id": author_id,
+                                    "name": author_name,
+                                    "institution": inst_name,
+                                    "raw_affiliation": raw_affs[0] if raw_affs else inst_name,
+                                    "match_type": f"Title/Abstract match: {', '.join(matched_terms[:4])}",
+                                    "best_relevance": rel_score,
+                                    "matched_terms": set(matched_terms),
+                                    "recent_pubs": [],
+                                    "_seen_titles": set(),
+                                }
+                            cand = bucket[author_id]
+                            cand["best_relevance"] = max(cand["best_relevance"], rel_score)
+                            cand["matched_terms"].update(matched_terms)
+                            cand["match_type"] = f"Title/Abstract match: {', '.join(sorted(cand['matched_terms'])[:4])}"
+                            if w_title not in cand["_seen_titles"]:
+                                cand["_seen_titles"].add(w_title)
+                                cand["recent_pubs"].append(pub_record)
+
+            # Stop early for Assam / NE once enough strong candidates exist
+            if query_target_region != "India" and len(raw_pool[query_target_region]) >= max_per_region * 2:
+                break
+
+    # Final selection: Assam -> Northeast India -> India (deduplicated across lists so each list is distinct)
+    output: Dict[str, List[Dict[str, Any]]] = {"India": [], "Northeast India": [], "Assam": []}
+    assigned_authors: Set[str] = set()
+
+    def rank_candidates(cands_dict: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        vals = list(cands_dict.values())
+        for c in vals:
+            c["recent_pubs"].sort(key=lambda p: (p["relevance_score"], p["year"]), reverse=True)
+            c.pop("_seen_titles", None)
+            c["matched_terms"] = sorted(c["matched_terms"])
+        vals.sort(
+            key=lambda c: (
+                c["best_relevance"],
+                len(c["recent_pubs"]),
+                c["recent_pubs"][0]["year"] if c["recent_pubs"] else 0,
+            ),
+            reverse=True,
+        )
+        return vals
+
+    for reg in ["Assam", "Northeast India", "India"]:
+        ranked = rank_candidates(raw_pool[reg])
+        selected: List[Dict[str, Any]] = []
+        for cand in ranked:
+            if cand["author_id"] in assigned_authors:
+                continue
+            selected.append(cand)
+            assigned_authors.add(cand["author_id"])
+            if len(selected) >= max_per_region:
+                break
+        output[reg] = selected
 
     coi_summary = {
         "excluded_authors": excluded_authors,
         "excluded_institutions": excluded_institutions,
         "coi_candidates_filtered": total_coi_excluded,
+        "search_queries_used": [q for q, _ in search_queries],
     }
     return output, coi_summary
 
 
 # ============================================================
-# MARKDOWN & DOCX REPORT BUILDERS
+# BLIND COPY BUILDER (REMOVES AUTHOR DETAILS ONLY; REST UNCHANGED)
+# ============================================================
+
+def _replace_regex_in_paragraph(para: Paragraph, pattern: re.Pattern, replacement: str) -> None:
+    full_text = para.text or ""
+    if not pattern.search(full_text):
+        return
+    # Fast path: single-run matches preserve run-level formatting
+    replaced_in_run = False
+    for r in para.runs:
+        if pattern.search(r.text or ""):
+            r.text = pattern.sub(replacement, r.text)
+            replaced_in_run = True
+    # Slow path: match spanned multiple runs
+    if pattern.search(para.text or "") or not replaced_in_run:
+        new_full = pattern.sub(replacement, para.text or "")
+        if para.runs:
+            para.runs[0].text = new_full
+            for r in para.runs[1:]:
+                r.text = ""
+        else:
+            para.text = new_full
+
+
+def _clear_paragraph(para: Paragraph) -> None:
+    for r in para.runs:
+        r.text = ""
+    for elem in list(para._element):
+        tag = elem.tag.split("}")[-1]
+        if tag in ("r", "hyperlink"):
+            para._element.remove(elem)
+
+
+def _remove_paragraph_element(para: Paragraph) -> None:
+    parent = para._element.getparent()
+    if parent is not None:
+        parent.remove(para._element)
+
+
+def _is_title_paragraph(txt: str, manuscript_title: str) -> bool:
+    norm_txt = normalize(txt).lower()
+    norm_title = normalize(manuscript_title).lower()
+    if not norm_txt or not norm_title:
+        return False
+    if norm_txt in norm_title or norm_title in norm_txt:
+        return True
+    t_words = {w for w in re.findall(r"[a-z0-9]{3,}", norm_title)}
+    p_words = {w for w in re.findall(r"[a-z0-9]{3,}", norm_txt)}
+    if not t_words or not p_words:
+        return False
+    overlap = len(t_words & p_words) / max(len(t_words), 1)
+    return overlap >= 0.55
+
+
+def _has_author_or_affiliation_signal(
+    txt: str,
+    extracted_authors: List[str],
+    extracted_affiliations: List[str],
+) -> bool:
+    clean = normalize(txt)
+    if not clean:
+        return False
+    lower = clean.lower()
+
+    if re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", clean, re.I):
+        return True
+    if re.search(r"(?:https?://)?orcid\.org/\d{4}-\d{4}-\d{4}-[\dX]{4}", clean, re.I):
+        return True
+    if re.match(
+        r"^(?:\*|†|‡)?\s*(?:corresponding\s+author|correspondence(?:\s+to)?|author\s+contributions?|authors?['’]?\s+contributions?|e-?mail|affiliations?|orcid)\b",
+        lower,
+    ):
+        return True
+
+    for auth in extracted_authors:
+        a = normalize(auth).lower()
+        if len(a) >= 4 and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", lower):
+            return True
+
+    for inst in extracted_affiliations:
+        i_low = normalize(inst).lower()
+        if len(i_low) >= 6 and i_low in lower:
+            return True
+        inst_toks = _distinctive_tokens(i_low)
+        txt_toks = _distinctive_tokens(lower)
+        if len(inst_toks) >= 2 and len(inst_toks & txt_toks) >= 2:
+            return True
+
+    if re.search(
+        r"\b(?:university|institute|college|department\s+of|faculty\s+of|school\s+of|centre\s+for|center\s+for|academy|laboratory|iit\b|nit\b|iiit\b|aiims\b|csir\b|icar\b)\b",
+        lower,
+    ):
+        return True
+
+    return False
+
+
+def blind_copy_docx(
+    original_bytes: bytes,
+    manuscript_title: str = "",
+    extracted_authors: Optional[List[str]] = None,
+    extracted_affiliations: Optional[List[str]] = None,
+) -> bytes:
+    authors_list = [a for a in (extracted_authors or []) if normalize(a)]
+    affils_list = [a for a in (extracted_affiliations or []) if normalize(a)]
+
+    doc = Document(io.BytesIO(original_bytes))
+    props = doc.core_properties
+    props.author = ""
+    props.last_modified_by = ""
+    props.comments = ""
+
+    email_re = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+    orcid_re = re.compile(r"(?:https?://)?orcid\.org/\d{4}-\d{4}-\d{4}-[\dX]{4}", re.I)
+    explicit_author_block_re = re.compile(
+        r"^(?:\*|†|‡)?\s*(?:corresponding\s+author|correspondence(?:\s+to)?|author\s+contributions?|authors?['’]?\s+contributions?|orcid\s*[:\-])\b",
+        re.I,
+    )
+    journal_meta_re = re.compile(
+        r"^(?:received|accepted|published|issn|doi|keywords?|running\s+title|original\s+(?:research\s+)?article|research\s+article|research\s+paper)\b",
+        re.I,
+    )
+
+    in_front_matter = True
+    seen_title = False
+
+    body_children = list(doc.element.body.iterchildren())
+    for child in body_children:
+        if isinstance(child, CT_P):
+            p = Paragraph(child, doc)
+            txt = normalize(p.text)
+
+            # Detect start of body (Abstract / Keywords / Introduction / implicit abstract)
+            if in_front_matter and txt:
+                if (
+                    re.match(r"^(?:(?:\d+\.?\s+)?(?:abstract|executive\s+summary|introduction|keywords?))\b", txt, re.I)
+                    or (
+                        word_count(txt) >= 35
+                        and not _has_author_or_affiliation_signal(txt, authors_list, affils_list)
+                        and not _is_title_paragraph(txt, manuscript_title)
+                    )
+                ):
+                    in_front_matter = False
+
+            if in_front_matter:
+                if not txt:
+                    continue
+                if _is_title_paragraph(txt, manuscript_title):
+                    seen_title = True
+                    continue
+                if journal_meta_re.match(txt):
+                    continue
+
+                is_byline_after_title = (
+                    seen_title
+                    and word_count(txt) <= 25
+                    and (
+                        bool(re.search(r"[*†‡§\d]", txt))
+                        or "," in txt
+                        or " and " in txt.lower()
+                    )
+                )
+                if _has_author_or_affiliation_signal(txt, authors_list, affils_list) or is_byline_after_title:
+                    _remove_paragraph_element(p)
+                    continue
+            else:
+                if explicit_author_block_re.match(txt):
+                    _remove_paragraph_element(p)
+                    continue
+                _replace_regex_in_paragraph(p, email_re, "[REDACTED]")
+                _replace_regex_in_paragraph(p, orcid_re, "[REDACTED]")
+
+            # Clean author-identifying textboxes inside front-matter paragraphs
+            for txbx in child.findall(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}txbxContent"):
+                for tp_elem in list(txbx.findall(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p")):
+                    tp = Paragraph(tp_elem, doc)
+                    t_txt = normalize(tp.text)
+                    if not t_txt:
+                        continue
+                    if (in_front_matter and not _is_title_paragraph(t_txt, manuscript_title) and _has_author_or_affiliation_signal(t_txt, authors_list, affils_list)) or explicit_author_block_re.match(t_txt):
+                        _clear_paragraph(tp)
+                    else:
+                        _replace_regex_in_paragraph(tp, email_re, "[REDACTED]")
+                        _replace_regex_in_paragraph(tp, orcid_re, "[REDACTED]")
+
+        elif isinstance(child, CT_Tbl):
+            tbl = Table(child, doc)
+            for row in list(tbl.rows):
+                for cell in row.cells:
+                    for cp in list(cell.paragraphs):
+                        ctxt = normalize(cp.text)
+                        if not ctxt:
+                            continue
+                        if in_front_matter and not _is_title_paragraph(ctxt, manuscript_title) and _has_author_or_affiliation_signal(ctxt, authors_list, affils_list):
+                            _clear_paragraph(cp)
+                        elif explicit_author_block_re.match(ctxt):
+                            _clear_paragraph(cp)
+                        else:
+                            _replace_regex_in_paragraph(cp, email_re, "[REDACTED]")
+                            _replace_regex_in_paragraph(cp, orcid_re, "[REDACTED]")
+
+    # Clean Headers & Footers across all sections without altering non-author headers/page numbers
+    for section in doc.sections:
+        for hf in [
+            section.header,
+            section.footer,
+            section.first_page_header,
+            section.first_page_footer,
+            section.even_page_header,
+            section.even_page_footer,
+        ]:
+            if not hf:
+                continue
+            for p in list(hf.paragraphs):
+                htxt = normalize(p.text)
+                if not htxt:
+                    continue
+                if _has_author_or_affiliation_signal(htxt, authors_list, affils_list):
+                    _clear_paragraph(p)
+                else:
+                    _replace_regex_in_paragraph(p, email_re, "[REDACTED]")
+                    _replace_regex_in_paragraph(p, orcid_re, "[REDACTED]")
+            for tbl in hf.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        for p in list(cell.paragraphs):
+                            htxt = normalize(p.text)
+                            if htxt and _has_author_or_affiliation_signal(htxt, authors_list, affils_list):
+                                _clear_paragraph(p)
+                            else:
+                                _replace_regex_in_paragraph(p, email_re, "[REDACTED]")
+                                _replace_regex_in_paragraph(p, orcid_re, "[REDACTED]")
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+# ============================================================
+# MARKDOWN PREVIEW & COMPREHENSIVE ALL-COMMENTS DOCX BUILDERS
 # ============================================================
 
 def generate_markdown_audit_report(
@@ -1529,10 +1953,11 @@ def generate_markdown_audit_report(
     for reg, cands in reviewers.items():
         rev_lines.append(f"#### {reg}")
         if not cands:
-            rev_lines.append("- No COI-free verified OpenAlex profiles identified for this region.")
+            rev_lines.append("- No COI-free Title/Abstract-matched OpenAlex profiles identified for this region.")
         for c in cands:
-            pubs_count = len(c.get("recent_pubs", []))
-            rev_lines.append(f"- **{c.get('name')}** ({c.get('institution')}): {c.get('match_type')} [{pubs_count} recent works]")
+            pubs = c.get("recent_pubs", [])
+            top_pub = f" — Latest match: *{pubs[0]['title']}* ({pubs[0]['year']})" if pubs else ""
+            rev_lines.append(f"- **{c.get('name')}** ({c.get('institution')}): {c.get('match_type')} [{len(pubs)} matching works]{top_pub}")
 
     return f"""# MRJ Academic Pre-Screening & Editorial Audit Report
 
@@ -1577,45 +2002,9 @@ def generate_markdown_audit_report(
 - **Enumeration / Text-Figure Inconsistencies:** {enum_str}
 - **Taxonomic Formatting & Typos:** {taxa_str}
 
-### 6. COI-Filtered Verified Reviewer Discovery (OpenAlex)
+### 6. COI-Filtered Verified Reviewer Discovery (OpenAlex — Title & Abstract Matched)
 {chr(10).join(rev_lines)}
 """
-
-
-def blind_copy_docx(original_bytes: bytes) -> bytes:
-    doc = Document(io.BytesIO(original_bytes))
-    props = doc.core_properties
-    props.author = ""
-    props.last_modified_by = ""
-    props.comments = ""
-
-    paras = list(doc.paragraphs)
-    abstract_idx = None
-    for i, p in enumerate(paras):
-        if re.match(r"(?i)^\s*abstract\b", p.text.strip()):
-            abstract_idx = i
-            break
-
-    if abstract_idx is not None and abstract_idx > 1:
-        first_kept = False
-        for i in range(abstract_idx):
-            txt = paras[i].text.strip()
-            if not txt:
-                continue
-            if not first_kept:
-                first_kept = True
-                continue
-            p_elem = paras[i]._element
-            p_elem.getparent().remove(p_elem)
-
-    for p in doc.paragraphs:
-        for r in p.runs:
-            r.text = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[REDACTED EMAIL]", r.text, flags=re.I)
-            r.text = re.sub(r"\b(?:https?://)?orcid\.org/\d{4}-\d{4}-\d{4}-[\dX]{4}\b", "[REDACTED ORCID]", r.text, flags=re.I)
-
-    out = io.BytesIO()
-    doc.save(out)
-    return out.getvalue()
 
 
 def generate_docx_report(
@@ -1624,13 +2013,15 @@ def generate_docx_report(
     coi_summary: Dict[str, Any],
 ) -> bytes:
     doc = Document()
-    doc.add_heading("MRJ Academic Pre-Screening & Editorial Audit Report", 0)
+    doc.add_heading("MRJ All-Comments Editorial Audit & Reviewer Report", 0)
     doc.add_paragraph(f"Manuscript Title: {audit.get('manuscript_title', 'Not specified')}")
+    if audit.get("extracted_authors"):
+        doc.add_paragraph(f"Detected Authors: {', '.join(audit['extracted_authors'])}")
     if audit.get("extracted_affiliations"):
         doc.add_paragraph(f"Author Affiliations (Excluded from Reviewer Match): {', '.join(audit['extracted_affiliations'])}")
 
     verd = audit.get("editorial_verdict", {})
-    doc.add_paragraph(f"Decision: {verd.get('decision', 'Under Review')}")
+    doc.add_paragraph(f"Editorial Decision: {verd.get('decision', 'Under Review')}")
     doc.add_paragraph(f"Executive Summary: {verd.get('executive_summary', '')}")
 
     reqs = verd.get("actionable_revision_requirements", [])
@@ -1642,12 +2033,19 @@ def generate_docx_report(
     # Pass 1
     doc.add_heading("1. Cross-Section Content Integrity & Discrepancy Audit", level=1)
     p1 = audit.get("pass_1_cross_section_integrity", {})
+    doc.add_paragraph("Claims Extracted from Abstract:")
+    for item in p1.get("abstract_claimed_items", []) or ["None extracted"]:
+        doc.add_paragraph(f"• {item}")
+    doc.add_paragraph("Claims Verified in Methods / Results:")
+    for item in p1.get("verified_in_body_items", []) or ["None verified"]:
+        doc.add_paragraph(f"• {item}")
+    doc.add_paragraph("Abstract vs. Body Discrepancies:")
     disc = p1.get("abstract_body_discrepancies", [])
     if disc:
         for d in disc:
             doc.add_paragraph(f"• {d}")
     else:
-        doc.add_paragraph("All Abstract claims are corroborated by empirical data in Methods and Results.")
+        doc.add_paragraph("• All Abstract claims are corroborated by empirical data in Methods and Results.")
 
     # Pass 2
     doc.add_heading("2. Template Compliance, Structural Audit & Reference Currency", level=1)
@@ -1655,6 +2053,8 @@ def generate_docx_report(
     doc.add_paragraph(f"Journal Style Compliance: {p2.get('journal_style_compliance', 'N/A')}")
     doc.add_paragraph(f"Multidisciplinary Domains Statement: {p2.get('multidisciplinary_domains_compliance', 'N/A')}")
     doc.add_paragraph(f"Abstract Word Count & Quality: {p2.get('abstract_quality_and_word_count', 'N/A')}")
+    doc.add_paragraph(f"Unwanted Thesis Subheadings: {', '.join(p2.get('unwanted_thesis_subheadings') or []) or 'None detected'}")
+    doc.add_paragraph(f"Template Placeholders Detected: {', '.join(p2.get('template_placeholders_detected') or []) or 'None detected'}")
     for note in p2.get("reference_currency_and_table_originality", []):
         doc.add_paragraph(f"• {note}")
 
@@ -1681,22 +2081,35 @@ def generate_docx_report(
     # Pass 4
     doc.add_heading("4. Domain Validity, Conceptual Framing & Reproducibility", level=1)
     p4 = audit.get("pass_4_domain_and_reproducibility", {})
-    for item in (
-        p4.get("data_vintage_and_novelty_notes", [])
-        + p4.get("terminology_and_proxy_validity_flags", [])
-        + p4.get("conceptual_overinterpretation_flags", [])
-        + p4.get("software_novelty_and_mapping_notes", [])
-        + p4.get("algorithmic_edge_cases_notes", [])
-    ):
-        doc.add_paragraph(f"• {item}")
+    doc.add_paragraph(f"Computational / Software Paper: {'Yes' if p4.get('is_computational_or_algorithm_paper') else 'No'}")
+    for label, key in [
+        ("Data Vintage & Novelty", "data_vintage_and_novelty_notes"),
+        ("Terminology / Proxy Validity", "terminology_and_proxy_validity_flags"),
+        ("Conceptual Over-Interpretation", "conceptual_overinterpretation_flags"),
+        ("Software Novelty & Mapping", "software_novelty_and_mapping_notes"),
+        ("Algorithmic Edge Cases", "algorithmic_edge_cases_notes"),
+    ]:
+        items = p4.get(key) or []
+        if items:
+            for item in items:
+                doc.add_paragraph(f"• [{label}] {item}")
     doc.add_paragraph(f"Software Versions: {p4.get('software_dependency_versions', 'None specified')}")
     doc.add_paragraph(f"Benchmarks / Scalability: {p4.get('benchmarks_and_scalability', 'None specified')}")
 
     # Pass 5
     doc.add_heading("5. Text-Level Accuracy & Visual Captions", level=1)
     p5 = audit.get("pass_5_literal_text_and_captions", {})
-    for fl in (p5.get("enumeration_figure_inconsistencies", []) + p5.get("taxonomic_formatting_flags", []) + p5.get("typographical_and_spacing_issues", [])):
-        doc.add_paragraph(f"• {fl}")
+    all_p5_flags = (
+        p5.get("enumeration_figure_inconsistencies", [])
+        + p5.get("taxonomic_formatting_flags", [])
+        + p5.get("typographical_and_spacing_issues", [])
+    )
+    if all_p5_flags:
+        for fl in all_p5_flags:
+            doc.add_paragraph(f"• {fl}")
+    else:
+        doc.add_paragraph("• No enumeration, taxonomic formatting, or typographical flags detected.")
+
     v_tbl = doc.add_table(rows=1, cols=4)
     v_tbl.style = "Table Grid"
     vh = v_tbl.rows[0].cells
@@ -1708,16 +2121,38 @@ def generate_docx_report(
         row[2].text = "Yes" if v.get("visual_present") else "No"
         row[3].text = v.get("status", "")
 
-    # Reviewers
-    doc.add_heading("6. COI-Filtered Verified Reviewer Discovery (OpenAlex)", level=1)
+    # Reviewers (India, Northeast India, Assam matched strictly to Title & Abstract)
+    doc.add_heading("6. COI-Filtered Verified Reviewer Discovery (India, Northeast India, Assam)", level=1)
+    if coi_summary.get("search_queries_used"):
+        doc.add_paragraph(f"Title & Abstract Search Queries Used: {', '.join(coi_summary['search_queries_used'])}")
     if coi_summary.get("excluded_institutions"):
         doc.add_paragraph(f"Excluded for Conflict of Interest: {', '.join(coi_summary['excluded_institutions'])}")
-    for reg, cands in reviewers.items():
+
+    for reg in ["India", "Northeast India", "Assam"]:
+        cands = reviewers.get(reg, [])
         doc.add_heading(reg, level=2)
         if not cands:
-            doc.add_paragraph("No COI-free matching reviewers identified.")
+            doc.add_paragraph("No COI-free matching reviewers identified for the Title & Abstract.")
+            continue
+        r_tbl = doc.add_table(rows=1, cols=4)
+        r_tbl.style = "Table Grid"
+        rh = r_tbl.rows[0].cells
+        rh[0].text, rh[1].text, rh[2].text, rh[3].text = (
+            "Reviewer Name",
+            "Institution / Affiliation",
+            "Title & Abstract Alignment",
+            "Matching Publications",
+        )
         for c in cands:
-            doc.add_paragraph(f"• {c.get('name')} ({c.get('institution')}): {c.get('match_type')} - {len(c.get('recent_pubs', []))} recent publications")
+            row = r_tbl.add_row().cells
+            row[0].text = c.get("name", "")
+            row[1].text = c.get("raw_affiliation") or c.get("institution", "")
+            row[2].text = c.get("match_type", "")
+            pubs = c.get("recent_pubs", [])[:2]
+            row[3].text = "\n".join(
+                f"({p.get('year', '')}) {p.get('title', '')} {p.get('doi', '')}".strip()
+                for p in pubs
+            ) or "N/A"
 
     out = io.BytesIO()
     doc.save(out)
@@ -1730,7 +2165,7 @@ def generate_docx_report(
 
 st.set_page_config(page_title="MRJ Manuscript Auditor (Hardened 5-Pass Engine)", page_icon="📄", layout="wide")
 st.title("📄 MRJ Manuscript Quality Auditor & Pre-Screening Engine")
-st.caption("Full-manuscript zero-truncation 5-Pass editorial audit: Template compliance, cross-section verification, statistical/sampling rigor, domain & proxy validity, algorithmic reproducibility, and COI-safe OpenAlex reviewer discovery.")
+st.caption("Full-manuscript zero-truncation 5-Pass editorial audit: Template compliance, cross-section verification, statistical/sampling rigor, domain & proxy validity, algorithmic reproducibility, and COI-safe OpenAlex reviewer discovery matched to Title & Abstract.")
 
 with st.sidebar:
     st.header("⚙️ Editorial Settings")
@@ -1778,21 +2213,33 @@ if uploaded_file and st.button("🚀 Run Full-Text 5-Pass MRJ Audit", type="prim
                 progress_cb=lambda msg: st.write(msg),
             )
 
-            st.write("Discovering COI-filtered domain reviewers via OpenAlex...")
+            st.write("Discovering COI-filtered reviewers from India, Northeast India & Assam strictly matched to Title & Abstract...")
             detected_title = audit_result.get("manuscript_title", "")
+            abstract_text = template_obs.get("abstract_text", "")
             keywords = template_obs.get("keywords_detected", [])
+            llm_queries = audit_result.get("reviewer_search_queries", [])
             reviewers, coi_summary = reviewer_discovery_report(
-                detected_title,
-                keywords,
+                title=detected_title,
+                abstract_text=abstract_text,
+                extracted_keywords=keywords,
+                llm_search_queries=llm_queries,
                 excluded_authors=audit_result.get("extracted_authors", []),
                 excluded_institutions=audit_result.get("extracted_affiliations", []),
                 mailto=openalex_mailto,
             )
 
-            st.write("Generating Markdown, Word (.docx), and Blind Copy exports...")
+            st.write("Generating All-Comments Report (.docx) and Author-Blind Reviewer Copy (.docx)...")
             md_report = generate_markdown_audit_report(audit_result, reviewers, coi_summary)
             orig_bytes = uploaded_file.getvalue()
-            blind_bytes = blind_copy_docx(orig_bytes) if uploaded_file.name.lower().endswith(".docx") else orig_bytes
+            if uploaded_file.name.lower().endswith(".docx"):
+                blind_bytes = blind_copy_docx(
+                    orig_bytes,
+                    manuscript_title=detected_title,
+                    extracted_authors=audit_result.get("extracted_authors", []),
+                    extracted_affiliations=audit_result.get("extracted_affiliations", []),
+                )
+            else:
+                blind_bytes = None
             docx_report = generate_docx_report(audit_result, reviewers, coi_summary)
             status_box.update(label="Full-Manuscript 5-Pass Audit Complete!", state="complete", expanded=False)
 
@@ -1838,7 +2285,7 @@ if "audit" in st.session_state:
                 st.markdown(f"- ⚠️ {r}")
 
     t_md, t1, t2, t3, t4, t5, t_rev = st.tabs([
-        "📄 Structured Markdown Report",
+        "📄 All-Comments Summary",
         "Pass 1: Cross-Section Integrity",
         "Pass 2: Template & Citations",
         "Pass 3: Statistical Rigor",
@@ -1937,58 +2384,53 @@ if "audit" in st.session_state:
         st.dataframe(p5.get("visual_asset_audit", []), use_container_width=True, hide_index=True)
 
     with t_rev:
-        st.subheader("COI-Filtered Relevant Reviewer Discovery (OpenAlex)")
+        st.subheader("COI-Filtered Relevant Reviewer Discovery (OpenAlex — Title & Abstract Matched)")
+        if coi_summary.get("search_queries_used"):
+            st.caption(f"**Title & Abstract Queries:** {' | '.join(coi_summary['search_queries_used'])}")
         if coi_summary.get("excluded_institutions") or coi_summary.get("excluded_authors"):
             st.info(
                 f"🛡️ **COI Filter Active:** Excluded **{coi_summary.get('coi_candidates_filtered', 0)}** candidate matches affiliated with "
                 f"{', '.join(coi_summary.get('excluded_institutions', [])) or 'manuscript institutions'}."
             )
-        for region, cands in reviewers.items():
+        for region in ["India", "Northeast India", "Assam"]:
+            cands = reviewers.get(region, [])
             st.markdown(f"### Region: {region}")
             if not cands:
-                st.write("No COI-free matching candidates located.")
+                st.write("No COI-free Title/Abstract-matched candidates located.")
                 continue
             r_rows = [
                 {
                     "Candidate Name": c.get("name"),
-                    "Affiliation": c.get("institution"),
-                    "Specialization": c.get("match_type"),
-                    "Recent Indexed Works": len(c.get("recent_pubs", [])),
-                    "Representative Work": c["recent_pubs"][0]["title"] if c.get("recent_pubs") else "N/A",
+                    "Affiliation": c.get("raw_affiliation") or c.get("institution"),
+                    "Title & Abstract Alignment": c.get("match_type"),
+                    "Matching Works": len(c.get("recent_pubs", [])),
+                    "Top Matching Paper": (
+                        f"({c['recent_pubs'][0]['year']}) {c['recent_pubs'][0]['title']}"
+                        if c.get("recent_pubs")
+                        else "N/A"
+                    ),
                 }
                 for c in cands
             ]
             st.dataframe(r_rows, use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.subheader("📥 Editorial Exports")
-    d1, d2, d3, d4 = st.columns(4)
+    st.subheader("📥 Editorial Exports (2 Files)")
+    d1, d2 = st.columns(2)
     d1.download_button(
-        "📝 Download Markdown Report (.md)",
-        data=st.session_state["md_report"],
-        file_name="MRJ_Editorial_Audit_Report.md",
-        mime="text/markdown",
-        use_container_width=True,
-    )
-    d2.download_button(
-        "📄 Download Word Report (.docx)",
+        "📄 Download All-Comments Audit Report (.docx)",
         data=st.session_state["docx_report"],
-        file_name="MRJ_Editorial_Audit_Report.docx",
+        file_name="MRJ_All_Comments_Audit_Report.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         use_container_width=True,
     )
-    if uploaded_file and uploaded_file.name.lower().endswith(".docx"):
-        d3.download_button(
+    if st.session_state.get("blind_bytes") is not None:
+        d2.download_button(
             "🙈 Download Blind Reviewer Copy (.docx)",
             data=st.session_state["blind_bytes"],
-            file_name="MRJ_Anonymized_Reviewer_Copy.docx",
+            file_name="MRJ_Blind_Reviewer_Copy.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
         )
-    d4.download_button(
-        "💾 Download Audit JSON (.json)",
-        data=json.dumps(audit, indent=2),
-        file_name="mrj_audit_data.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+    else:
+        d2.info("Blind Reviewer Copy (.docx) is generated when the uploaded manuscript is a .docx file.")
